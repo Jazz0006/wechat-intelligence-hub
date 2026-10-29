@@ -60,6 +60,14 @@ def default_wechat_reader_path() -> str:
     if configured:
         return str(Path(configured).expanduser())
     codex_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    if sys.platform == "win32":
+        # Use Python directly, avoiding cmd.exe/PowerShell argument interpretation
+        # for untrusted chat names and search strings.
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "RionWeChat/share/rion-wechat-cli/rion_wechat_reader.py",
+            Path(__file__).resolve().parents[1] / "rion-wechat-reader/rion_wechat_reader.py",
+        ]
+        return str(next((path for path in candidates if path.is_file()), candidates[0]))
     candidates = [
         codex_root / "skills" / "wechat-cli" / "scripts" / "reader.sh",
         Path(__file__).resolve().parents[2] / "skills" / "wechat-cli" / "scripts" / "reader.sh",
@@ -6185,6 +6193,13 @@ def rows_to_messages(rows: list[dict[str, Any]], source: str) -> list[Message]:
 
 
 def run_json_command(command: list[str]) -> Any:
+    if sys.platform == "win32" and command and Path(command[0]).suffix.casefold() in {".cmd", ".bat", ".ps1"}:
+        raise SystemExit("Windows后端请指向rion_wechat_reader.py，避免把聊天参数交给命令解释器。")
+    if command and Path(command[0]).suffix.casefold() == ".py":
+        engine = Path(command[0])
+        installed_python = engine.parent / "venv" / "Scripts" / "python.exe"
+        interpreter = str(installed_python) if sys.platform == "win32" and installed_python.is_file() else sys.executable
+        command = [interpreter, *command]
     result = subprocess.run(command, text=True, capture_output=True)
     if result.returncode != 0:
         raise SystemExit(

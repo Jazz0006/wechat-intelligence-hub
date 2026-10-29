@@ -24,6 +24,18 @@ Rion 的通用 Skill 合集 `rionwu-skills` 只负责收录、发现和链接本
 
 ## 安装
 
+### Windows 10/11 x64
+
+本分支提供原生 PowerShell 安装入口（Python 3.11/3.12 x64）：
+
+```powershell
+.\scripts\install.ps1
+```
+
+包含只读 Reader、诊断/材料导入和实验性 Windows 获取模块。获取需要单独选择本人微信进程、绑定活动 DLL 与账号目录，并明确确认；不会自动提权、注入或重启微信。
+默认候选格式和可选版本 profile 有明确边界，**尚未完成本分支 Windows 微信真机获取验收，不保证全部4.x构建可用**。
+安装、授权、最近24小时导出和验收步骤见 [Windows 使用说明](docs/WINDOWS.md)。
+
 **9月22日接入更新：** 已增加材料编码/格式兼容、明确错误码、独立解密计数和`diagnose`诊断。JEV可选辅助分流，但不参与密钥验证；Windows首次获取仍待真机验收。见[更新与排障提示词](docs/access-upgrade-2026-09-22.md)。
 
 向维护者反馈前，让本地Codex运行`access.sh diagnose --support-summary`；Windows用Reader环境的Python运行`rion_wechat_access.py diagnose --support-summary`。它只输出允许分享的版本、状态、计数和错误码，仍请本人检查后再发。只有网页对话、没有本机文件及命令执行能力时，无法直接接入本机微信。另一个工具已能读取时，优先验证已有材料或已解密数据库，不要求重新获取；见[常见卡点处理](docs/access-support.md)。
@@ -43,7 +55,7 @@ Rion 的通用 Skill 合集 `rionwu-skills` 只负责收录、发现和链接本
 
 ### 手动安装入口
 
-**先确认接入条件：安装成功不等于已能读取聊天。** 已有本机访问材料可直接验证、导入；没有key时，由Codex按[五步首次接入工作流](skills/wechat-cli/references/access-onboarding.md)核对平台与候选工具。仅对已审核且适配的候选，经明确确认后尝试获取；macOS候选可能重启微信和重签名副本，Windows获取尚未合入。仓库不捆绑获取工具，安装和日常日报均不会触发获取；macOS新机器获取路径尚未实测，不保证所有版本可用。请勿向维护者、社群或Issue发送key、密码和数据库。
+**先确认接入条件：安装成功不等于已能读取聊天。** 已有本机访问材料可直接验证、导入；没有key时，由Codex按[五步首次接入工作流](skills/wechat-cli/references/access-onboarding.md)核对平台与候选工具。仅对已审核且适配的候选，经明确确认后尝试获取；macOS候选可能重启微信和重签名副本，本分支Windows原生实验入口见上节。安装和日常日报均不会触发获取；首次获取仍需真机验收，不保证所有版本可用。请勿向维护者、社群或Issue发送key、密码和数据库。
 
 克隆仓库：
 

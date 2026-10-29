@@ -22,8 +22,9 @@ import tempfile
 import time
 
 import rion_wechat_reader as reader
+import rion_wechat_windows as windows
 
-ACCESS_REVISION = "2026-09-30.3"
+ACCESS_REVISION = "2026-10-29.windows.1"
 
 # Fixed messages only: exceptions may contain private paths or provider material.
 MATERIAL_ERRORS = {
@@ -69,6 +70,8 @@ def support_next_step(report: dict) -> str:
         return "review_coverage"
     if state in {"verification_failed", "invalid_access_material", "access_material_requires_review"}:
         return "review_existing_material"
+    if state == "windows_plan_required":
+        return "prepare_windows_plan"
     if state in {"needs_access", "acquisition_platform_not_supported"}:
         return "review_access_options"
     return "manual_review"
@@ -79,7 +82,7 @@ def support_summary(report: dict) -> dict:
     states = {"ready", "ready_to_configure", "needs_access", "dependency_required", "partial",
               "verification_failed", "unsafe_key_permissions", "needs_database_location",
               "database_layout_unsupported", "scan_incomplete", "account_selection_required",
-              "access_material_requires_review", "acquisition_platform_not_supported",
+              "access_material_requires_review", "acquisition_platform_not_supported", "windows_plan_required",
               "existing_configuration_requires_review", "invalid_access_material", "database_missing",
               "filesystem_access_required"}
     current_state = report.get("state")
@@ -821,15 +824,15 @@ def onboard(args: argparse.Namespace) -> dict:
     if platform.system() != "Darwin":
         outcome.update(state="acquisition_platform_not_supported", next_actions=["此助手尚未实现本系统获取；可以验证用户已有的授权材料。"])
         if platform.system() == "Windows":
+            outcome["state"] = "windows_plan_required"
             outcome["windows_route"] = {
-                "status": "community_report_not_integrated",
-                "reported_dll_version": "4.1.13.12",
+                "status": "native_experimental_not_live_verified",
                 "reference": "skills/wechat-cli/references/windows-access.md",
                 "acquisition_performed": False,
             }
             outcome["next_actions"] = [
-                "Windows获取仍未合入；先看windows-access指引，区分依赖、ACL、转换和校验失败。",
-                "已有本人材料先验证复用。社区4.1.13.12成功案例不代表本机兼容，不删平台判断、不自动运行群友脚本。",
+                "已有材料优先显式导入。实验性Windows原生获取用windows-plan绑定本人PID、账号目录和活动DLL，再经独立确认运行windows-acquire；Mac的run入口仍不支持Windows。",
+                "新模块尚无微信真机验收；4.1.x可能需要经审核、与DLL哈希和版本绑定的profile，不自动套用其他构建的候选转换规则。",
             ]
         return outcome
     if reader.sqlcipher_driver()[0] is None:
@@ -903,11 +906,28 @@ def main(argv: list[str] | None = None) -> int:
             output_mode = p.add_mutually_exclusive_group()
             output_mode.add_argument("--jev-request", action="store_true", help="Include an allowlisted Jev request; does not call the network")
             output_mode.add_argument("--support-summary", action="store_true", help="Output only allowlisted support fields for review before sharing")
+    p = sub.add_parser("windows-plan", help="Windows x64: bind one same-user process and account; no memory scan")
+    p.add_argument("--pid", required=True, type=int)
+    p.add_argument("--database-root", required=True, type=Path)
+    p.add_argument("--out", required=True, type=Path, help="New plan file inside a private directory")
+    p.add_argument("--profile", type=Path, help="Optional reviewed, DLL-build-bound candidate rules")
+    p = sub.add_parser("windows-acquire", help="Explicit, bounded Windows read-only process scan")
+    p.add_argument("--plan-file", required=True, type=Path)
+    p.add_argument("--confirm-process-read", action="store_true")
+    p.add_argument("--confirm-reviewed-profile", action="store_true")
+    p.add_argument("--timeout", type=int, default=60)
+    p.add_argument("--max-mb", type=int, default=512)
+    p.add_argument("--max-candidates", type=int, default=256)
     args = parser.parse_args(argv)
     try:
         if args.command == "_worker":
             return worker(args)
-        if args.command == "plan":
+        if args.command == "windows-plan":
+            result = windows.prepare(args.pid, args.database_root, args.out, args.profile)
+        elif args.command == "windows-acquire":
+            result = windows.acquire(args.plan_file, args.confirm_process_read, args.timeout,
+                                     args.max_mb, args.max_candidates, args.confirm_reviewed_profile)
+        elif args.command == "plan":
             result = inspect(args.provider, args.sha256, args.database_root)
         elif args.command == "onboard":
             result = onboard(args)
@@ -922,11 +942,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result = run(args)
         print(json.dumps({"ok": True, "data": result}, ensure_ascii=False, indent=2))
-        return 0 if args.command in {"plan", "status", "diagnose", "finish-recovery"} or result["state"] == "ready" else 1
-    except (AccessError, reader.ReaderError, OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return 0 if args.command in {"plan", "windows-plan", "status", "diagnose", "finish-recovery"} or result["state"] in {"ready", "material_verified"} else 1
+    except (AccessError, windows.WindowsAccessError, reader.ReaderError, OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
         # Never forward provider or SQLCipher exception strings to the agent.
         exc = sys.exc_info()[1]
-        code = str(exc) if isinstance(exc, AccessError) else (material_diagnostic(exc)["code"] if isinstance(exc, reader.ReaderError) else "access_validation_failed")
+        code = str(exc) if isinstance(exc, (AccessError, windows.WindowsAccessError)) else (material_diagnostic(exc)["code"] if isinstance(exc, reader.ReaderError) else "access_validation_failed")
         guidance = {
             "database_read_permission_denied": "实际提权进程无法读取数据库。先核对系统授权对象与文件权限；本阶段未启动provider，不要用重复获取代替权限修复。",
             "database_files_not_found": "所选目录没有可读的.db文件。确认是本人账号目录，未启动provider。",

@@ -1,5 +1,16 @@
 # Windows 接入：先定位阶段，再决定是否获取
 
+## 本分支新增原生实验入口
+
+`scripts/install.ps1`支持Windows 10/11 x64、Python3.11/3.12。Windows使用安装的`rion-wechat-access.ps1`或直接调用Python助手，不使用`access.sh`。
+新增`windows-plan`（指定本人PID和账号，只检查身份/活动DLL/版本，不读内存）和`windows-acquire`（独立确认、有外层超时、字节/候选上限、同用户校验、逐库HMAC和SQLCipher验证）。
+不自动提权、退出微信、注入或写进程。原macOS `run`仍拒绝Windows，不应删除其平台检查。
+默认只识别SQLCipher raw字面量；其他布局仅通过经审核、绑定实际DLL版本与哈希的profile接入，没有捆绑已验证的4.1.x规则。profile须额外审核/确认，不可上传。
+完整命令、限制和真机验收清单见仓库`docs/WINDOWS.md`。本次仅有离线/加密虚构库证据；Windows原生CI和微信实读须另行验收。
+以下带日期的说明保留历史背景；其中“未合入”描述当时主仓库。
+
+## 上游历史证据与外部案例
+
 2026-09-22后续：Windows原生CI的Python 3.11/3.12均已通过真实ACL、中文路径、UTF-16材料与虚构SQLCipher数据库导入测试；[执行记录](https://github.com/Rion-Wu-tech/wechat-intelligence-hub/actions/runs/35638032153)。连接目录已去掉残留的POSIX权限判断，验证临时目录先设置ACL。此结果只验证相关读取/导入基础能力，不验证真实微信首次获取或完整日报。
 
 截至2026-09-30，反馈分为三层，不能混称为“Windows已解决”：

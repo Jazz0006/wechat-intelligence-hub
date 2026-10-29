@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - 'projects/rion-wechat-reader/**'
+      - 'scripts/install.ps1'
       - '.github/workflows/windows-reader.yml'
   pull_request:
     paths:
       - 'projects/rion-wechat-reader/**'
+      - 'scripts/install.ps1'
       - '.github/workflows/windows-reader.yml'
   workflow_dispatch:
 
@@ -31,3 +33,20 @@ jobs:
           python -m pip install --only-binary=:all: sqlcipher3==0.6.2 zstandard==0.25.0
       - name: Test actual Windows ACL and encrypted import
         run: python -m unittest discover -s projects/rion-wechat-reader/tests -p test_windows_native.py -v
+      - name: Test acquisition boundaries and owned Win32 memory fixture
+        run: python -m unittest discover -s projects/rion-wechat-reader/tests -p test_windows_acquisition.py -v
+      - name: Validate native installer and installed commands
+        shell: pwsh
+        run: |
+          foreach ($script in @('scripts/install.ps1', 'projects/rion-wechat-reader/install.ps1')) {
+            $tokens = $null; $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script), [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          $prefix = Join-Path $env:RUNNER_TEMP 'rion reader 中文'
+          & ./scripts/install.ps1 -Prefix $prefix -Python (Get-Command python).Source
+          if ($LASTEXITCODE -ne 0) { throw 'Installer failed' }
+          & (Join-Path $prefix 'bin/rion-wechat-cli.ps1') self-test --require-sqlcipher
+          if ($LASTEXITCODE -ne 0) { throw 'Installed self-test failed' }
+          & (Join-Path $prefix 'bin/rion-wechat-access.ps1') windows-plan --help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed access module missing' }

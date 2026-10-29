@@ -117,8 +117,8 @@ class WindowsPermissionsTests(unittest.TestCase):
              mock.patch.dict(access.os.environ, {"RION_WECHAT_READER_KEYS": ""}), \
              mock.patch.object(access, "run", side_effect=AssertionError("no acquisition")):
             result = access.onboard(args)
-        self.assertEqual(result["state"], "acquisition_platform_not_supported")
-        self.assertEqual(result["windows_route"]["status"], "community_report_not_integrated")
+        self.assertEqual(result["state"], "windows_plan_required")
+        self.assertEqual(result["windows_route"]["status"], "native_experimental_not_live_verified")
         self.assertFalse(result["windows_route"]["acquisition_performed"])
 
     def test_preview_directory_protected_before_yield(self):

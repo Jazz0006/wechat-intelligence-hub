@@ -60,6 +60,7 @@ trap - EXIT
 
 python3 -m py_compile "$repo_root/projects/rion-wechat-reader/rion_wechat_reader.py"
 python3 -m py_compile "$repo_root/projects/rion-wechat-reader/rion_wechat_access.py"
+python3 -m py_compile "$repo_root/projects/rion-wechat-reader/rion_wechat_windows.py"
 
 python3 -m py_compile "$repo_root/projects/rion-wechat-reader/scripts/capability_gap.py"
 python3 -m py_compile "$repo_root/projects/rion-wechat-reader/scripts/live_parity.py"

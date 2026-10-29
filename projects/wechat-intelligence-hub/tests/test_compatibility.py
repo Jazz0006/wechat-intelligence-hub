@@ -23,6 +23,26 @@ class WeChatCompatibilityTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_windows_python_backend_keeps_chat_arguments_out_of_shell(self) -> None:
+        engine = self.root / "reader/rion_wechat_reader.py"
+        interpreter = engine.parent / "venv/Scripts/python.exe"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b"synthetic-runtime")
+        chat = 'fictional & echo synthetic | example'
+        completed = __import__("subprocess").CompletedProcess([], 0, '{"ok":true}', '')
+        with mock.patch.object(radar.sys, "platform", "win32"), \
+             mock.patch.object(radar.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(radar.run_json_command([str(engine), "timeline", chat]), {"ok": True})
+        self.assertEqual(run.call_args.args[0], [str(interpreter), str(engine), "timeline", chat])
+        self.assertFalse(run.call_args.kwargs.get("shell", False))
+
+    def test_windows_batch_backends_are_rejected(self) -> None:
+        with mock.patch.object(radar.sys, "platform", "win32"), \
+             mock.patch.object(radar.subprocess, "run") as run:
+            with self.assertRaises(SystemExit):
+                radar.run_json_command(["reader.cmd", "timeline", "fictional & value"])
+        run.assert_not_called()
+
     def write_wechat_version(self, version: str, build: str, bundle_version: str) -> None:
         with self.plist.open("wb") as handle:
             plistlib.dump(

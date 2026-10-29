@@ -28,6 +28,9 @@ Reader 核心不提供：
 
 ## 快速检查
 
+Windows 使用 `install.ps1`，不依赖 Bash。接入助手新增 `windows-plan`（只绑定进程/版本）和 `windows-acquire`（单独确认后的有界只读获取）。
+默认只识别SQLCipher raw字面量，特定4.1.x布局需要经审阅且匹配DLL构建的profile；本分支尚未Windows微信真机验收。完整步骤见 [Windows指南](../../docs/WINDOWS.md)。
+
 ```bash
 ./install.sh --with-sqlcipher
 rion-wechat-cli self-test
