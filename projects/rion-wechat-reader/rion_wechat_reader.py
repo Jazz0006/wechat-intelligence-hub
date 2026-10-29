@@ -23,6 +23,7 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -166,9 +167,9 @@ def load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReaderError(f"无法读取配置：{path}: {exc}") from exc
+        value = json.loads(path.read_bytes())
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ReaderError("无法读取配置 JSON；支持 UTF-8/BOM、UTF-16 和 UTF-32", "invalid_json") from exc
     if not isinstance(value, dict):
         raise ReaderError(f"配置必须是 JSON 对象：{path}")
     return value
@@ -197,8 +198,96 @@ def time_iso(value: int | float | None) -> str:
     return dt.datetime.fromtimestamp(float(value)).astimezone().isoformat(timespec="seconds")
 
 
+def windows_private_acl(path: Path, *, initialize: bool = False) -> bool:
+    """Check real ACLs; initialize only a newly created private resource."""
+    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if not shell or not path.exists() or path.is_symlink():
+        return False
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$item = Get-Item -LiteralPath $env:RION_READER_ACL_PATH -Force
+if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { exit 2 }
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($env:RION_READER_ACL_INITIALIZE -eq '1') {
+    if ($item.PSIsContainer) {
+        $new = [Security.AccessControl.DirectorySecurity]::new()
+        $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    } else {
+        $new = [Security.AccessControl.FileSecurity]::new()
+        $inherit = [Security.AccessControl.InheritanceFlags]::None
+    }
+    $new.SetOwner($sid)
+    $new.SetAccessRuleProtection($true, $false)
+    foreach ($identity in @($sid, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+        $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+            $identity, 'FullControl', $inherit, 'None', 'Allow')
+        $new.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $env:RION_READER_ACL_PATH -AclObject $new
+}
+$acl = Get-Acl -LiteralPath $env:RION_READER_ACL_PATH
+$valid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $sid.Value
+$currentAllowed = $false
+foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -eq 'Allow') {
+        if ($rule.IdentityReference.Value -notin @($sid.Value, 'S-1-5-18')) { $valid = $false }
+        if ($rule.IdentityReference.Value -eq $sid.Value) { $currentAllowed = $true }
+    }
+}
+if ($valid -and $currentAllowed) { 'SAFE' } else { 'UNSAFE' }
+"""
+    try:
+        result = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+            env={**os.environ, "RION_READER_ACL_PATH": str(path.absolute()),
+                 "RION_READER_ACL_INITIALIZE": "1" if initialize else "0"},
+            capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return result.returncode == 0 and result.stdout.strip() == b"SAFE"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def permission_help() -> str:
+    if platform.system() == "Windows":
+        return "请检查 Windows ACL，仅允许当前用户和 SYSTEM；无法检查时核对 PowerShell，勿跳过权限验证"
+    return "请先执行 chmod 600"
+
+
 def safe_mode(path: Path) -> bool:
-    return not path.exists() or stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+    if not path.exists():
+        return True
+    if platform.system() == "Windows":
+        return windows_private_acl(path)
+    return stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+
+
+def prepare_private_output(path: Path, *, chmod_parent: bool = True) -> None:
+    created = not path.parent.exists()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if platform.system() == "Windows":
+        if not windows_private_acl(path.parent, initialize=created):
+            raise ReaderError(permission_help(), "unsafe_key_permissions")
+    elif chmod_parent:
+        os.chmod(path.parent, 0o700)
+
+
+def protect_new_file(path: Path) -> None:
+    if platform.system() == "Windows":
+        if not windows_private_acl(path, initialize=True):
+            raise ReaderError(permission_help(), "unsafe_key_permissions")
+    else:
+        os.chmod(path, 0o600)
+
+
+@contextlib.contextmanager
+def private_temporary_directory(*, prefix: str):
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        path = Path(directory)
+        if platform.system() == "Windows" and not windows_private_acl(path, initialize=True):
+            raise ReaderError(permission_help(), "unsafe_key_permissions")
+        yield directory
 
 
 def is_hex(value: Any, lengths: set[int]) -> bool:
@@ -318,6 +407,9 @@ class DatabaseSet:
                 raise ReaderError(f"{name} 必须是整数", "invalid_key_parameters") from exc
 
         key = str(spec.get("key") or "").strip()
+        literal = re.fullmatch(r"[xX]'([0-9a-fA-F]{64}|[0-9a-fA-F]{96})'", key)
+        if literal:
+            key = literal.group(1)
         if not is_hex(key, {64, 96}):
             raise ReaderError(f"{filename} 的 raw key 必须是 64 或 96 位十六进制", "invalid_key")
         result: dict[str, Any] = {"key": key}
@@ -636,6 +728,9 @@ def shape_search_rows(
     shaped: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        if snippet_only or not include_text:
+            item.pop("message_content", None)
+            item.pop("compress_content", None)
         if not include_text:
             item.pop("text", None)
             item.pop("content", None)
@@ -1009,6 +1104,11 @@ def search_messages(
     after: str | None,
     before: str | None,
     search_mode: str = "contains",
+    *,
+    sender_filter: str | None = None,
+    from_me: bool | None = None,
+    kind_name: str | None = None,
+    base_kind: int | None = None,
 ) -> list[dict[str, Any]]:
     start = parse_time(after)
     end = parse_time(before)
@@ -1063,6 +1163,8 @@ def search_messages(
                             "kind_name": message_kind(int(item.get("local_type") or 0), str(content)),
                         }
                     )
+                    if not filter_message_rows([item], sender_filter, from_me, kind_name, base_kind):
+                        continue
                     result.append(item)
                     matched_in_table += 1
                     if matched_in_table >= limit + offset:
@@ -1666,12 +1768,12 @@ def cache_maintenance(db: DatabaseSet, command: str) -> dict[str, Any]:
 def secure_write_text(path: Path, content: str, force: bool) -> None:
     if path.exists() and not force:
         raise ReaderError(f"导出目标已存在，未覆盖：{path}", "output_exists")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    prepare_private_output(path, chmod_parent=False)
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            protect_new_file(Path(temp_name))
             handle.write(content)
-        os.chmod(temp_name, 0o600)
         os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):
@@ -1911,18 +2013,24 @@ def discover_databases(root: Path, max_files: int, keys_file: Path | None = None
         if stop:
             break
     authorized_encrypted_count = 0
+    unrecognized_readable_count = 0
     if keys_file and keys_file.is_file() and locked_paths:
         if not safe_mode(keys_file):
-            raise ReaderError(f"密钥文件权限过宽，请先执行 chmod 600：{keys_file}", "unsafe_key_permissions")
+            raise ReaderError(f"密钥文件权限过宽，{permission_help()}：{keys_file}", "unsafe_key_permissions")
         with tempfile.TemporaryDirectory(prefix="rion-wechat-discovery-") as temp_dir:
             config = Path(temp_dir) / "config.json"
             config.write_text(json.dumps({"keys_file": str(keys_file.resolve())}), encoding="utf-8")
             authorized_db = DatabaseSet(config)
             for path in locked_paths:
-                kinds = inspect_authorized_database(authorized_db, path)
-                if not kinds:
+                try:
+                    with authorized_db.connect(path) as conn:
+                        tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                except ReaderError:
                     continue
                 authorized_encrypted_count += 1
+                kinds = classify_database_tables(tables)
+                if not kinds:
+                    unrecognized_readable_count += 1
                 for kind in kinds:
                     candidates[kind].append(str(path.resolve()))
     return {
@@ -1930,6 +2038,7 @@ def discover_databases(root: Path, max_files: int, keys_file: Path | None = None
         "scanned_file_count": scanned,
         "unreadable_or_encrypted_count": unreadable_or_encrypted,
         "authorized_encrypted_count": authorized_encrypted_count,
+        "unrecognized_readable_count": unrecognized_readable_count,
         "unresolved_database_count": unreadable_or_encrypted - authorized_encrypted_count,
         "scan_error_count": scan_errors,
         "truncated": truncated,
@@ -2056,7 +2165,7 @@ def access_plan(
             str(config.get("keys_file") or "~/.config/rion-wechat-reader/keys.json"),
         )).expanduser()
         if selected_keys.exists() and not safe_mode(selected_keys):
-            return finish("unsafe_key_permissions", "访问材料权限过宽，尚未读取其内容。", "在本机收紧该文件权限至0600后再检查；不要上传文件。")
+            return finish("unsafe_key_permissions", "访问材料权限未通过检查，尚未读取其内容。", permission_help())
         try:
             material = load_json(selected_keys)
         except ReaderError:
@@ -2139,8 +2248,8 @@ def setup_cli(
     bundled_root: Path | None = None
     if database_root is None and keys_file.is_file() and safe_mode(keys_file):
         try:
-            keys_value = json.loads(keys_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            keys_value = json.loads(keys_file.read_bytes())
+        except (OSError, ValueError, UnicodeError):
             keys_value = {}
         if isinstance(keys_value, dict) and keys_value.get("database_root"):
             bundled_root = Path(str(keys_value["database_root"])).expanduser()
@@ -2188,7 +2297,7 @@ def setup_cli(
     if not self_username:
         inferred_username = infer_self_username(db)
         if inferred_username:
-            config_value = json.loads(config_path.read_text(encoding="utf-8"))
+            config_value = json.loads(config_path.read_bytes())
             config_value["self_username"] = inferred_username
             secure_write_json(config_path, config_value, force=True)
             db = DatabaseSet(config_path)
@@ -2240,10 +2349,9 @@ def self_test(require_sqlcipher: bool = False) -> dict[str, Any]:
                 conn.commit()
             finally:
                 conn.close()
-            config = Path(temp_dir) / "config.json"
-            keys = Path(temp_dir) / "keys.json"
-            keys.write_text(json.dumps({"keys": {encrypted.name: key}}), encoding="utf-8")
-            keys.chmod(0o600)
+            config = Path(temp_dir) / "private" / "config.json"
+            keys = config.with_name("keys.json")
+            secure_write_json(keys, {"keys": {encrypted.name: key}})
             config.write_text(json.dumps({"keys_file": str(keys)}), encoding="utf-8")
             with DatabaseSet(config).connect(encrypted) as encrypted_conn:
                 sqlcipher["roundtrip"] = encrypted_conn.execute("SELECT value FROM probe").fetchone()[0] == "encrypted-ok"
@@ -2260,14 +2368,13 @@ def self_test(require_sqlcipher: bool = False) -> dict[str, Any]:
 def secure_write_json(path: Path, value: dict[str, Any], force: bool = False) -> None:
     if path.exists() and not force:
         raise ReaderError(f"配置已存在，未覆盖：{path}；确认后使用 --force")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    prepare_private_output(path)
     fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            protect_new_file(Path(temp_name))
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.chmod(temp_name, 0o600)
         os.replace(temp_name, path)
     finally:
         if os.path.exists(temp_name):
@@ -2294,12 +2401,13 @@ def import_access_bundle(
     if not source.is_file():
         raise ReaderError("授权材料文件不存在", "access_bundle_missing")
     if not safe_mode(source):
-        raise ReaderError("授权材料文件权限过宽，请先执行 chmod 600", "unsafe_key_permissions")
+        raise ReaderError(f"授权材料文件权限过宽，{permission_help()}", "unsafe_key_permissions")
     try:
-        loaded = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ReaderError("授权材料不是有效 JSON", "invalid_access_bundle") from exc
-    raw_entries = loaded.get("keys", loaded) if isinstance(loaded, dict) else None
+        loaded = json.loads(source.read_bytes())
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ReaderError("授权材料不是有效 JSON", "invalid_json") from exc
+    normalized_salt_map = isinstance(loaded, dict) and isinstance(loaded.get("salt_keys"), dict)
+    raw_entries = loaded.get("salt_keys", loaded.get("keys", loaded)) if isinstance(loaded, dict) else None
     if not isinstance(raw_entries, dict):
         raise ReaderError("授权材料必须是路径到 key 信息的对象", "invalid_access_bundle")
 
@@ -2309,7 +2417,7 @@ def import_access_bundle(
         schema_version = 0
     schema2_salt_map = schema_version >= 2 and isinstance(loaded, dict) and isinstance(loaded.get("keys"), dict)
     if database_root is None:
-        bundled_root = loaded.get("db_root") if schema2_salt_map and isinstance(loaded, dict) else None
+        bundled_root = (loaded.get("database_root") or loaded.get("db_root")) if isinstance(loaded, dict) else None
         if not bundled_root:
             raise ReaderError(
                 "路径型授权材料需要显式提供 --database-root",
@@ -2321,7 +2429,9 @@ def import_access_bundle(
 
     imported: dict[str, dict[str, Any]] = {}
     imported_salts: dict[str, dict[str, Any]] = {}
-    metadata_count = len(set(loaded) - {"keys"}) if schema2_salt_map else 0
+    metadata_fields = {"database_root", "db_root", "schema_version", "wxid", "image_key"}
+    wrapped = "keys" in loaded or "salt_keys" in loaded
+    metadata_count = len(set(loaded) - {"keys", "salt_keys"}) if wrapped else 0
     missing_file_count = 0
     root = database_root.resolve()
     allowed_parameters = {
@@ -2335,21 +2445,30 @@ def import_access_bundle(
     }
     for raw_name, raw_value in raw_entries.items():
         name = str(raw_name)
-        if name.startswith("_"):
+        if name.startswith("_") or (not wrapped and name in metadata_fields):
             metadata_count += 1
             continue
         if isinstance(raw_value, str):
             spec: dict[str, Any] = {"key": raw_value}
         elif isinstance(raw_value, dict):
-            key = raw_value.get("key") or raw_value.get("enc_key")
+            if raw_value.get("passphrase") is not None or raw_value.get("material_type") == "passphrase":
+                raise ReaderError("口令需要按数据库参数派生，不能作为raw key导入", "passphrase_requires_derivation")
+            supplied = [str(raw_value[field]).strip() for field in ("key", "enc_key", "raw_key") if raw_value.get(field)]
+            if len(set(supplied)) > 1:
+                raise ReaderError("同一条目存在冲突的密钥字段", "conflicting_key_fields")
+            key = supplied[0] if supplied else None
             spec = {"key": key}
             spec.update({parameter: raw_value[parameter] for parameter in allowed_parameters if parameter in raw_value})
         else:
             raise ReaderError("授权材料包含不支持的 key 条目", "invalid_access_bundle")
-        if schema2_salt_map:
+        if schema2_salt_map or normalized_salt_map:
             if not is_hex(name, {32}):
                 raise ReaderError("schema-2 授权材料包含无效数据库 salt", "invalid_access_bundle")
-            raw_key = str(spec.get("key") or "").strip()
+            raw_key = DatabaseSet.validated_key_spec(spec, "salt entry")["key"]
+            if is_hex(raw_key, {96}):
+                if raw_key[-32:].casefold() != name.casefold():
+                    raise ReaderError("normalized raw key salt mismatch", "key_salt_mismatch")
+                raw_key = raw_key[:64]
             if not is_hex(raw_key, {64}):
                 raise ReaderError("schema-2 enc_key 必须是 64 位十六进制", "invalid_key")
             imported_salts[name.casefold()] = DatabaseSet.validated_key_spec(
@@ -2398,13 +2517,16 @@ def import_access_bundle(
         driver, _driver_name = sqlcipher_driver()
         if driver is None:
             raise ReaderError("验证加密数据库需要 SQLCipher 运行环境", "sqlcipher_driver_required")
-        with tempfile.TemporaryDirectory(prefix="rion-wechat-access-import-") as temp_dir:
+        with private_temporary_directory(prefix="rion-wechat-access-import-") as temp_dir:
             staged_keys = Path(temp_dir) / "keys.json"
             secure_write_json(staged_keys, staged_value)
             discovery = discover_databases(root, max(1, max_files), staged_keys)
         matched = int(discovery["authorized_encrypted_count"])
         unresolved = int(discovery["unresolved_database_count"])
-        verification.update({"matched_database_count": matched, "unresolved_database_count": unresolved})
+        verification.update({"matched_database_count": matched, "unresolved_database_count": unresolved,
+                             "unrecognized_readable_count": discovery["unrecognized_readable_count"],
+                             "scan_truncated": discovery["truncated"], "scan_error_count": discovery["scan_error_count"],
+                             "verification_level": "sqlite_schema_read"})
         if matched == 0:
             raise ReaderError(
                 "授权材料未能打开任何发现的加密数据库；未写入目标 key 文件",
@@ -2447,7 +2569,7 @@ def initialize_config(
     if not keys_file.exists():
         secure_write_json(keys_file, {"keys": {}}, force=False)
     elif not safe_mode(keys_file):
-        raise ReaderError(f"密钥文件权限过宽，请先执行 chmod 600：{keys_file}")
+        raise ReaderError(f"密钥文件权限过宽，{permission_help()}：{keys_file}")
     value = {
         "session_db": str(session_db.resolve()),
         "contact_db": str(contact_db.resolve()),
@@ -3114,16 +3236,20 @@ def main(argv: list[str] | None = None) -> int:
                     db,
                     args.keyword,
                     args.chat,
-                    args.limit,
+                    args.limit + 1,
                     args.offset,
                     args.after,
                     args.before,
                     args.search_mode,
+                    sender_filter=args.sender,
+                    from_me=args.from_me,
+                    kind_name=args.kind_name,
+                    base_kind=args.base_kind,
                 )
-                rows = filter_message_rows(rows, args.sender, args.from_me, args.kind_name, args.base_kind)
-                rows = apply_search_mode(rows, args.keyword, args.search_mode)
+                has_more = len(rows) > args.limit
+                rows = rows[:args.limit]
                 rows = shape_search_rows(rows, args.include_text, args.snippet_only, args.max_text_chars)
-                emit(command, {"query": {"has_more": len(rows) == args.limit, "next_offset": args.offset + len(rows)}, "messages": rows}, args.pretty)
+                emit(command, {"query": {"has_more": has_more, "next_offset": args.offset + len(rows)}, "messages": rows}, args.pretty)
             elif command == "search-context":
                 before_count = args.before_messages if args.before_messages is not None else args.before_count
                 after_count = args.after_messages if args.after_messages is not None else args.after_count

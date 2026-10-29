@@ -1,0 +1,33 @@
+name: Windows reader synthetic checks
+
+on:
+  push:
+    paths:
+      - 'projects/rion-wechat-reader/**'
+      - '.github/workflows/windows-reader.yml'
+  pull_request:
+    paths:
+      - 'projects/rion-wechat-reader/**'
+      - '.github/workflows/windows-reader.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-reader:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python }}'
+      - name: Install binary runtime dependencies
+        run: |
+          python -m pip install --only-binary=:all: sqlcipher3==0.6.2 zstandard==0.25.0
+      - name: Test actual Windows ACL and encrypted import
+        run: python -m unittest discover -s projects/rion-wechat-reader/tests -p test_windows_native.py -v

@@ -44,11 +44,15 @@ from intelligence_views import (
     brief_report,
     home_report,
     infer_promise_action,
+    open_promise_rows,
     person_report,
     reply_report,
     topic_report,
 )
 from report_bundle_html import render_report_bundle
+from report_security import protect_document, require_sanitizer, safe_href, sanitize_fragment
+from message_time import local_timestamp as display_timestamp, parse_timestamp, register_time_sql, timestamp_epoch, validate_window
+from message_identity import conversation_key, source_chat_id
 
 
 def default_wechat_reader_path() -> str:
@@ -586,6 +590,7 @@ class Signal:
 
 
 def normalize_time(value: str | None) -> str:
+    # Keep the storage representation stable: historical message hashes include it.
     if not value:
         return ""
     value = str(value).replace("/", "-").strip()
@@ -598,15 +603,7 @@ def normalize_time(value: str | None) -> str:
 
 
 def parse_time_for_filter(value: str | None) -> datetime | None:
-    normalized = normalize_time(value)
-    if not normalized:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(normalized, fmt)
-        except ValueError:
-            continue
-    return None
+    return parse_timestamp(display_timestamp(value))
 
 
 def read_json_messages(path: Path) -> list[Message]:
@@ -3046,7 +3043,7 @@ def write_group_daily_html(
 
     link_items = "".join(
         "<li>"
-        f'<a href="{html_escape(str(row.get("链接") or ""), quote=True)}" target="_blank" rel="noopener noreferrer">'
+        f'<a href="{html_escape(safe_href(str(row.get("链接") or "")) or "#", quote=True)}" target="_blank" rel="noopener noreferrer">'
         f'{html_escape(shorten(str(row.get("链接") or ""), 90))}</a>'
         f'<span>{html_escape(str(row.get("相关群聊") or ""))}｜{html_escape(str(row.get("判断依据") or ""))}</span>'
         "</li>"
@@ -3129,7 +3126,7 @@ function apply(){{const q=search.value.trim().toLowerCase(); rows.forEach(row=>{
 search.addEventListener('input',apply); buttons.forEach(button=>button.addEventListener('click',()=>{{filter=button.dataset.filter; buttons.forEach(item=>item.setAttribute('aria-pressed',String(item===button))); apply();}}));
 apply();
 </script></body></html>"""
-    path.write_text(html, encoding="utf-8")
+    path.write_text(protect_document(html), encoding="utf-8")
 
 
 def clean_url(raw_url: str) -> str:
@@ -3377,6 +3374,8 @@ def write_cross_group_link_report(out_dir: Path, rows: list[dict[str, str]], sin
 
 def message_hash(message: Message) -> str:
     raw = "\n".join([message.chat, message.sender, message.time, message.content])
+    if source_chat_id(message.source_file):
+        raw += "\nchat-id:" + source_chat_id(message.source_file)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -3788,6 +3787,18 @@ def insert_messages_to_db(conn: sqlite3.Connection, run_id: int, messages: list[
     for message in messages:
         digest = message_hash(message)
         existing = conn.execute("select id from messages where hash = ?", (digest,)).fetchone()
+        if not existing and source_chat_id(message.source_file):
+            legacy_digest = hashlib.sha256("\n".join([
+                message.chat, message.sender, message.time, message.content,
+            ]).encode("utf-8")).hexdigest()
+            legacy = conn.execute(
+                "select id, source_file from messages where hash = ?", (legacy_digest,),
+            ).fetchone()
+            # Upgrade only a proven same-conversation row, retaining IDs used by
+            # FTS and link evidence. Ambiguous imports are not silently merged.
+            if legacy and source_chat_id(str(legacy["source_file"])) == source_chat_id(message.source_file):
+                conn.execute("update messages set hash = ? where id = ?", (digest, legacy["id"]))
+                existing = legacy
         if existing:
             message_id = int(existing["id"])
         else:
@@ -5064,7 +5075,10 @@ def brief_command(args: argparse.Namespace) -> None:
         print(text)
 
 
-CONTACT_ACK_TERMS = re.compile(r"^(?:好(?:的|呀|滴)?|收到|明白|嗯嗯|没问题|可以|谢谢|辛苦了?|不客气)[呀啊哈啦~～。！!\s]*$", re.I)
+CONTACT_ACK_TERMS = re.compile(
+    r"^(?:(?:好(?:的|呀|滴)?|收到|明白|嗯嗯|没问题|可以|谢谢(?:老师)?|辛苦(?:老师)?了?|不客气)"
+    r"[呀啊哈啦~～，,、。！!\s]*)+$", re.I,
+)
 CONTACT_REPLY_REQUEST_TERMS = re.compile(
     r"请问|麻烦|方便|能否|可以吗|怎么|多少|什么时候|哪天|确认一下|回复一下|发我|给我|"
     r"报价|预算|费用|价格|brief|排期|初稿|二稿|终稿|审核|修改|结算|付款|发票|invoice|payment|\?|？",
@@ -5103,50 +5117,45 @@ def contact_daily_status(
     return "留意", "先看前后文判断是否需要承接；没有明确问题或动作时可不回复。"
 
 
-def find_open_contact_promise(
+def find_open_contact_promises(
     conn: sqlite3.Connection,
     chat: str,
     until: str,
     self_names: list[str],
     *,
     lookback_days: int = 30,
-) -> dict[str, str] | None:
+    chat_id: str | None = None,
+) -> list[dict[str, str]]:
+    register_time_sql(conn)
     until_dt = parse_time_for_filter(until) or datetime.now()
     history_since = (until_dt - timedelta(days=max(1, lookback_days))).strftime("%Y-%m-%d %H:%M:%S")
     history = [
         dict(row)
         for row in conn.execute(
             """
-            select sender, time, content
+            select chat, sender, time, content, source_file
             from messages
-            where chat = ? and time >= ? and time <= ?
-            order by time asc
+            where chat = ? and message_epoch(time) >= message_epoch(?) and message_epoch(time) <= message_epoch(?)
+            order by message_epoch(time) asc, id asc
             """,
             (chat, history_since, until),
         ).fetchall()
     ]
-    promise_indexes = [
-        index
-        for index, row in enumerate(history)
-        if is_self_sender(str(row["sender"]), self_names)
-        and PROMISE_TERMS.search(str(row["content"]))
-    ]
-    if not promise_indexes:
-        return None
-    promise_index = promise_indexes[-1]
-    later_self_messages = [
-        row
-        for row in history[promise_index + 1 :]
-        if is_self_sender(str(row["sender"]), self_names)
-    ]
-    if any(PROMISE_COMPLETION_TERMS.search(str(row["content"])) for row in later_self_messages):
-        return None
-    promise = history[promise_index]
-    return {
+    if chat_id is not None:
+        history = [row for row in history if source_chat_id(str(row["source_file"])) == chat_id]
+    return [{
         "时间": str(promise["time"]),
         "内容": shorten(str(promise["content"]), 220),
         "下一步": infer_promise_action(str(promise["content"])),
-    }
+    } for promise in open_promise_rows(history, self_names)]
+
+
+def find_open_contact_promise(
+    conn: sqlite3.Connection, chat: str, until: str, self_names: list[str], *, lookback_days: int = 30,
+) -> dict[str, str] | None:
+    """Legacy single-item API; new reports use the complete promise list."""
+    promises = find_open_contact_promises(conn, chat, until, self_names, lookback_days=lookback_days)
+    return promises[-1] if promises else None
 
 
 def build_contact_daily_rows(
@@ -5156,24 +5165,26 @@ def build_contact_daily_rows(
     label_index: dict[str, set[str]],
     self_names: list[str],
 ) -> list[dict[str, Any]]:
+    register_time_sql(conn)
+    validate_window(since, until)
     db_rows = conn.execute(
         """
         select chat, sender, time, content, source_file
         from messages
-        where time >= ? and time <= ?
-        order by time asc
+        where message_epoch(time) >= message_epoch(?) and message_epoch(time) <= message_epoch(?)
+        order by message_epoch(time) asc, id asc
         """,
         (since, until),
     ).fetchall()
     groups = load_known_group_chats(conn)
-    by_chat: dict[str, list[Message]] = {}
+    by_chat: dict[tuple[str, str], list[Message]] = {}
     for row in db_rows:
         message = Message(**dict(row))
         if message.chat in groups or "@chatroom" in message.source_file:
             continue
-        by_chat.setdefault(message.chat, []).append(message)
+        by_chat.setdefault(conversation_key(message.chat, message.source_file), []).append(message)
 
-    open_opportunities: dict[str, dict[str, Any]] = {}
+    open_opportunities: dict[str, list[dict[str, Any]]] = {}
     for row in conn.execute(
         """
         select id, chat, title, opportunity_type, stage, status, priority,
@@ -5184,7 +5195,10 @@ def build_contact_daily_rows(
         order by priority desc, last_signal_time desc
         """
     ).fetchall():
-        open_opportunities.setdefault(str(row["chat"]), dict(row))
+        open_opportunities.setdefault(str(row["chat"]), []).append(dict(row))
+    identities_by_name: dict[str, set[str]] = {}
+    for row in conn.execute("select distinct chat, source_file from messages"):
+        identities_by_name.setdefault(str(row["chat"]), set()).add(source_chat_id(str(row["source_file"])))
     rows: list[dict[str, Any]] = []
     priority_labels = set(configured_labels("priority"))
     commercial_labels = set(configured_labels("commercial"))
@@ -5200,8 +5214,8 @@ def build_contact_daily_rows(
         for label, pattern in configured_group_value_patterns().items()
         if label not in GROUP_VALUE_PATTERNS
     }
-    for chat, messages in by_chat.items():
-        messages = sorted(dedupe_messages(messages), key=lambda message: message.time or "")
+    for (chat, chat_id), messages in by_chat.items():
+        messages = sorted(dedupe_messages(messages), key=lambda message: timestamp_epoch(message.time) or 0)
         if chat == "服务通知" or all(
             "notifymessage" in message.source_file or message.sender.endswith("@app")
             for message in messages
@@ -5227,24 +5241,32 @@ def build_contact_daily_rows(
             message for message in personal_priority_messages
             if not is_self_sender(message.sender, self_names)
         ]
-        opportunity = open_opportunities.get(chat)
+        opportunities = open_opportunities.get(chat, [])
+        identity_ambiguous = len(identities_by_name.get(chat, set()) - {""}) > 1
+        # Legacy opportunities are name-keyed; do not attribute them to either
+        # of two same-named people without an explicit identity binding.
+        if identity_ambiguous:
+            opportunities = []
+        opportunity = opportunities[0] if opportunities else None
         is_priority_contact = bool(labels & (priority_labels | commercial_labels | creator_labels))
         if contact_scope == "priority_labels_only" and not is_priority_contact:
             continue
-        manually_tracked = bool(
-            opportunity
-            and (
-                opportunity.get("status") in {"active", "waiting", "paused"}
-                or opportunity.get("stage_locked")
-                or opportunity.get("priority_locked")
-                or opportunity.get("next_action_locked")
-            )
+        manually_tracked = any(
+            item.get("status") in {"active", "waiting", "paused"}
+            or item.get("stage_locked") or item.get("priority_locked") or item.get("next_action_locked")
+            for item in opportunities
         )
         has_two_way_commercial_context = bool(has_self_message and external_commercial_messages)
+        first_inbound_request = any(
+            CONTACT_REPLY_REQUEST_TERMS.search(message.content)
+            or re.search(r"请问|怎么收费|多少钱|需要.{0,20}(?:培训|讲师|推广|定制)|(?:合作|商单).{0,16}(?:推荐你|找你|邀请你)", message.content, re.I)
+            for message in external_commercial_messages
+        )
         has_two_way_personal_context = bool(has_self_message and external_personal_priority_messages)
         if not (
             is_priority_contact
             or manually_tracked
+            or first_inbound_request
             or has_two_way_commercial_context
             or has_two_way_personal_context
         ):
@@ -5268,13 +5290,16 @@ def build_contact_daily_rows(
             self_names,
             bool(commercial_messages or personal_priority_messages or opportunity),
         )
-        open_promise = find_open_contact_promise(conn, chat, until, self_names)
+        promises = find_open_contact_promises(conn, chat, until, self_names, chat_id=chat_id)
+        open_promise = promises[-1] if promises else None
         if open_promise:
             status = "待兑现"
-            reply_direction = f"先{open_promise['下一步']}；完成后再向对方同步，不用只回一条客套消息。"
+            reply_direction = "；".join(dict.fromkeys(promise["下一步"] for promise in promises)) + "；按下方承诺逐项核实，不要把一个项目的完成当作全部完成。"
         rows.append(
             {
                 "联系人": chat,
+                "会话ID": chat_id,
+                "身份待核实": identity_ambiguous,
                 "角色": role,
                 "标签": sorted(labels),
                 "消息数": len(messages),
@@ -5284,9 +5309,11 @@ def build_contact_daily_rows(
                 "状态": status,
                 "回复建议": reply_direction,
                 "历史承诺": open_promise,
+                "待兑现承诺": promises,
                 "商业消息数": len(commercial_messages),
                 "个人重点消息数": len(personal_priority_messages),
                 "商机": opportunity,
+                "商机列表": opportunities,
                 "最近消息": [asdict(message) for message in messages[-6:]],
             }
         )
@@ -5352,13 +5379,14 @@ def write_contact_daily_report(path: Path, rows: list[dict[str, Any]], since: st
                 f"- **回复建议**：{row['回复建议']}",
             ]
         )
-        if opportunity:
+        if row.get("身份待核实"):
+            lines.append("- **身份待核实**：发现同名不同会话；旧商机尚未绑定会话 ID，请先核对，未自动归入此人。")
+        for opportunity in row.get("商机列表", [opportunity] if opportunity else []):
             lines.append(
-                f"- **当前商机**：#{opportunity.get('id')}｜{opportunity.get('stage')}｜"
-                f"{opportunity.get('next_action') or '待人工确认'}"
+                f"- **当前商机**：#{opportunity.get('id')}｜{opportunity.get('title')}｜{opportunity.get('stage')}｜"
+                f"{opportunity.get('next_action') or '待人工确认'}｜跟进：{opportunity.get('next_follow_up') or '待确认'}"
             )
-        if row.get("历史承诺"):
-            promise = row["历史承诺"]
+        for promise in row.get("待兑现承诺", [row["历史承诺"]] if row.get("历史承诺") else []):
             lines.append(
                 f"- **未兑现承诺**：{promise.get('时间')}｜{promise.get('内容')}｜{promise.get('下一步')}"
             )
@@ -5378,7 +5406,7 @@ def write_contact_daily_report(path: Path, rows: list[dict[str, Any]], since: st
                 + ("、".join(priority_label_names) or "尚未设置")
                 + "。未打这些标签的联系人不进入重点联系人页。"
                 if contact_scope == "priority_labels_only"
-                else "- 本报告覆盖个人 Profile 重点标签、开放商机、双向商业对话，或命中个人自定义重点主题的私聊。"
+                else "- 本报告覆盖个人 Profile 重点标签、开放商机、首次入站商业线索、双向商业对话，或命中个人自定义重点主题的私聊。入站线索不等于已确认合作。"
             ),
             "- 微信标签不自动等同于真实角色；具体身份仍需查看原始聊天核实。",
             "- 回复建议是方向，不会发送微信；金额、排期和承诺必须人工确认。",
@@ -5891,28 +5919,30 @@ def render_report_command(args: argparse.Namespace) -> None:
         raise SystemExit("生成 HTML 需要 pandoc。Markdown 报告不受影响；安装 pandoc 后重试即可。")
 
     output = Path(args.out).expanduser().resolve() if args.out else source.with_suffix(".html")
-    output.parent.mkdir(parents=True, exist_ok=True)
+    require_sanitizer()
     css = Path(args.css).expanduser().resolve() if args.css else Path(__file__).resolve().parent / "assets" / "report.css"
     command = [
         pandoc,
         str(source),
-        "--from=gfm",
+        "--sandbox",
+        "--from=gfm-raw_html",
         "--to=html5",
-        "--standalone",
-        "--embed-resources",
-        "--metadata",
-        "lang=zh-CN",
-        "--metadata",
-        f"title={args.title or source.stem}",
-        "--output",
-        str(output),
     ]
-    if css.is_file():
-        command.extend(["--css", str(css)])
-    result = subprocess.run(command, text=True, capture_output=True)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=60)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "pandoc 转换失败").strip()
         raise SystemExit(detail)
+    fragment = sanitize_fragment(result.stdout)
+    style = css.read_text(encoding="utf-8") if css.is_file() else ""
+    style = re.sub(r"</style", r"<\\/style", style, flags=re.I)
+    document = (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>{html_escape(args.title or source.stem)}</title><style>{style}</style>'
+        f'</head><body><main>{fragment}</main></body></html>'
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(protect_document(document, static=True), encoding="utf-8")
     print(f"输入 Markdown：{source}")
     print(f"最终 HTML：{output}")
 
@@ -6134,7 +6164,9 @@ def rows_to_messages(rows: list[dict[str, Any]], source: str) -> list[Message]:
         if not content:
             continue
         chat = first_value(row, ["chat", "chat_name", "room", "room_name", "contact", "talker", "session", "name"]) or "未命名会话"
+        talker = first_value(row, ["talker", "chat_id", "username"])
         if isinstance(chat, dict):
+            talker = first_value(chat, ["username", "talker", "chat_id"]) or talker
             chat = first_value(chat, ["display_name", "name", "talker", "username"]) or "未命名会话"
         sender = first_value(row, ["sender", "from", "speaker", "nickname", "user", "sender_name"]) or chat
         time = first_value(row, ["time", "time_iso", "create_time", "created_at", "datetime", "date", "msg_time"]) or ""
@@ -6146,7 +6178,7 @@ def rows_to_messages(rows: list[dict[str, Any]], source: str) -> list[Message]:
                 sender=str(sender).strip(),
                 time=normalize_time(str(time)),
                 content=str(content).strip(),
-                source_file=source,
+                source_file=f"wechat-cli:timeline:{talker}" if source.startswith("wechat-cli:") and isinstance(talker, str) and talker.strip() else source,
             )
         )
     return messages
@@ -6717,10 +6749,10 @@ def extract_query(raw: Any) -> dict[str, Any]:
 
 
 def dedupe_messages(messages: list[Message]) -> list[Message]:
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[str] = set()
     unique: list[Message] = []
     for message in messages:
-        key = (message.chat, message.sender, message.time, message.content)
+        key = message_hash(message)
         if key in seen:
             continue
         seen.add(key)

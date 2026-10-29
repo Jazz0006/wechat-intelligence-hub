@@ -1,5 +1,9 @@
 # Access bundle compatibility
 
+2026-09-22: JSON may be UTF-8 (with or without BOM), UTF-16 or UTF-32. Path entries also accept `raw_key` and strict SQLCipher `x'<hex>'` literals. Salt maps accept 64-hex keys or 96-hex key+salt; the appended salt must match the mapping key. Explicit passphrases are not silently treated as raw keys. Windows uses the Reader's private ACL policy, not POSIX mode bits.
+
+Successful schema reads count independently of recognized WeChat tables. `unrecognized_readable_count` means decryption succeeded but classification did not; `verification_level=sqlite_schema_read` does not claim whole-database integrity. Scan truncation and errors remain in the verification result.
+
 `rion-wechat-cli import-access` converts either of these user-supplied local JSON formats:
 
 1. a path map whose non-metadata entries map database-relative paths to a hexadecimal key string or an object containing `enc_key`/`key`;

@@ -11,6 +11,8 @@
 | `access.sh connect` | 验证用户指定的已有材料，成功后发布新的 Reader 配置 | 虚构 SQLCipher 数据库集成测试 |
 | `access.sh run` | macOS 系统授权后调用已审核的外部工具，再 connect | 源码核验和模拟授权测试；尚无新机器端到端实测 |
 | `access.sh onboard` | 串联检查、复用、已有材料接入、待授权获取分支；默认只检查 | 虚构数据库及授权分支测试；实际获取成熟度同run |
+| `access.sh status` | 安全诊断：当前接入状态、版本、上次阶段与建议检查；不清锁、不获取 | 隔离测试及已有本机配置只读验收，不代表新机获取成功 |
+| `access.sh finish-recovery` | 用户事后确认微信可用且获取已结束，重新检查进程后只移除恢复锁 | 隔离测试；不把进程存在当作登录已验证 |
 
 安装独立 CLI 后也可用 `rion-wechat-access`，参数相同。Windows 暂不提供获取实现；不能宣称任意版本一键接入或零风险。
 
@@ -47,9 +49,13 @@
 
 ## 失败与恢复
 
+先运行`access.sh status`，按[接入故障表](access-troubleshooting.md)处理。实际提权worker会在provider启动前读取所选db_storage文件头，并验证Apple Python/LLDB可导入且具备关键启动身份、进程身份及事件等待接口；只做接口内省，不启动调试目标。这些检查失败不会退出微信。助手统一账号目录与db_storage的参数差异。provider输出只在内存中流式识别固定标记，原始输出不落盘、不返回；标记只能提示排查方向。
+
+root-PBKDF身份、事件等待和失败清理已有本地候选补丁，放在开源仓库的`providers/wxkey/`；仍未经过真实提权微信获取验证，不是默认稳定工具。`HOME`正确不等于微信进程UID正确；身份无法核验就停止，不能关闭SIP来冒充修复。部分系统的副本启动限制仍未解决。
+
 默认获取执行上限600秒，可设置30至900秒；系统授权等待另有余量。超时会尝试停止工具进程组，但通过系统启动的微信副本可能仍在，授权超时的子进程也可能尚未退出。不要宣称已经完全恢复，也不要立即再跑一次。
 
-失败或取消保留 `~/.config/rion-wechat-reader/access-runs/recovery-required.lock`，阻止重复尝试。恢复时先检查该目录中的固定状态结果和仍运行的获取进程，确认原微信可正常打开、副本已按用户意愿退出；不要输出原始访问材料或删除原微信。若材料已生成，优先单独 connect 验证；确实需要重试时，只有在确认没有上次残留进程、原因已修复并得到用户确认后，才移除这一个恢复锁。不要清空配置目录或删掉旧密钥。
+获取后保留 `~/.config/rion-wechat-reader/access-runs/recovery-required.lock`，即使数据库已验证通过也不会自动清锁。正常查询不受影响，但不能重复获取。恢复时先检查固定状态结果和仍运行的获取进程；`status`的进程计数不证明登录成功或所有获取进程都已结束。用户事后确认官方微信可用且获取已结束后，再按[恢复确认流程](access-troubleshooting.md#完成恢复检查)执行`finish-recovery`，不能自动加确认参数或直接删锁。若材料已生成，优先单独connect验证，不清空配置目录或删旧密钥。
 
 成功仍需抽检已知群聊、私聊、所需标签、关键词和时间范围。没有同步到本机的聊天不会因获得 key 而出现。日报只读现有数据库，不常驻取key；聊天进入云模型上下文时，不宣称分析全程离线。
 
@@ -69,5 +75,7 @@ shasum -a 256 "$HOME/.local/libexec/rion-wechat-access/9b70eec/wxkey"
 ```
 
 4. Codex执行 `onboard --provider ... --sha256 ... --database-root ...`。审核完成且用户明确确认副作用后，在同一命令加 `--apply --confirm-reviewed-provider --confirm-side-effects`；助手获取后自动验证导入，不要求用户打开JSON复制key。
+
+**兼容候选路线**：若在维护接入能力或经同意验证兼容性，先读取已克隆仓库的`providers/wxkey/README.md`和`candidate.json`。该路线固定为包含Intel修复的`01e96fa58ce3ff061dce83e4c36f62104ebc6b16`加本地生命周期补丁，用`prepare_candidate.py`准备，不能用上面的旧版`go install`冒充已应用新补丁。准备/编译/普通用户小程序测试不等于微信取key成功，不自动替换用户当前provider。真实获取的独立确认、恢复锁和数据库验证要求不变。
 
 上游不可用、代码无法审核、构建失败或当前微信不兼容时，说明具体阻塞步骤。不得编造获取成功，也不让用户关闭SIP或使用来历不明的二进制来绕过阻塞。

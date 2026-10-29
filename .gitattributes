@@ -1,0 +1,2 @@
+# Unified patches retain leading context spaces before upstream Go tabs.
+providers/wxkey/*.patch -whitespace

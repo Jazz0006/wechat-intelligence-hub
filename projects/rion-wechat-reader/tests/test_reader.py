@@ -771,6 +771,31 @@ class ReaderContractTest(unittest.TestCase):
         rows = payload["data"]["results"]
         self.assertEqual(rows[0]["match"]["local_id"], 2)
         self.assertEqual([row["local_id"] for row in rows[0]["context"]], [1, 2])
+
+    def test_search_filters_before_pagination_and_has_more_uses_lookahead(self):
+        first = self.run_cli("search", ".", "--search-mode", "regex", "--type", "text",
+                             "--limit", "1")["data"]
+        self.assertEqual([r["local_id"] for r in first["messages"]], [2])
+        self.assertTrue(first["query"]["has_more"])
+        second = self.run_cli("search", ".", "--search-mode", "regex", "--type", "text",
+                              "--limit", "1", "--offset", "1")["data"]
+        self.assertEqual([r["local_id"] for r in second["messages"]], [1])
+        self.assertFalse(second["query"]["has_more"])
+        incoming = self.run_cli("search", ".", "--search-mode", "regex", "--type", "text",
+                                "--no-from-me", "--limit", "1")["data"]
+        self.assertEqual([r["local_id"] for r in incoming["messages"]], [1])
+        self.assertFalse(incoming["query"]["has_more"])
+
+    def test_search_snippet_and_no_text_do_not_leak_raw_body(self):
+        for flag in ("--snippet-only", "--no-include-text"):
+            result = self.run_cli("search", "你好", flag, "--max-text-chars", "1")["data"]["messages"][0]
+            self.assertNotIn("message_content", result)
+            self.assertNotIn("compress_content", result)
+            if flag == "--snippet-only":
+                self.assertEqual(result["text"], "你")
+            else:
+                self.assertNotIn("text", result)
+                self.assertNotIn("content", result)
         filtered = self.run_cli(
             "search-with-context",
             "明天发方案",

@@ -6,8 +6,10 @@ Default Skill entrypoint: `${CODEX_HOME:-$HOME/.codex}/skills/wechat-cli/scripts
 
 ```bash
 reader.sh self-test
-reader.sh setup --pretty
+reader.sh access-plan --pretty
 ```
+
+Follow the returned state. Reuse `ready`; run setup only for `ready_to_configure`. For a failed acquisition, use `access.sh status` and [the troubleshooting table](access-troubleshooting.md) before considering another attempt. `setup` configures verified inputs, not a key-acquisition command.
 
 独立安装公开 CLI 时，完整加密数据库链路使用 `projects/rion-wechat-reader/install.sh --with-sqlcipher`。安装后先运行 `rion-wechat-cli self-test --require-sqlcipher`；该测试只创建和读取临时虚构加密数据库，不访问微信数据。
 

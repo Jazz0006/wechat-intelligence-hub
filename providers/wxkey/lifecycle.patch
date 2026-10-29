@@ -1,0 +1,427 @@
+diff --git a/cmd/wxkey/main.go b/cmd/wxkey/main.go
+index 4e1440a..6fdf69d 100644
+--- a/cmd/wxkey/main.go
++++ b/cmd/wxkey/main.go
+@@ -77,6 +77,26 @@ Notes:
+ `
+ 
+ func main() {
++	os.Exit(failureExit(runCLI))
++}
++
++type commandFailure struct{}
++
++// Unwind command defers before main exits; unexpected panics remain visible.
++func failureExit(run func()) (code int) {
++	defer func() {
++		if problem := recover(); problem != nil {
++			if _, ok := problem.(commandFailure); !ok {
++				panic(problem)
++			}
++			code = 1
++		}
++	}()
++	run()
++	return 0
++}
++
++func runCLI() {
+ 	if len(os.Args) < 2 {
+ 		fmt.Fprint(os.Stderr, usage)
+ 		os.Exit(2)
+@@ -1166,29 +1186,38 @@ func prepareShadowWeChat() (int, func(), error) {
+ 		return 0, nil, err
+ 	}
+ 
+-	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
+-	if err := exec.Command("/usr/bin/open", "-n", shadowPath).Run(); err != nil {
+-		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
+-	}
+-	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
+-	if err != nil {
+-		return 0, nil, err
+-	}
+-
+ 	cleanup := func() {
+ 		if envTrue("WXKEY_KEEP_SHADOW_WECHAT") {
+ 			return
+ 		}
+-		_ = exec.Command("/bin/kill", "-TERM", strconv.Itoa(pid)).Run()
++		killWeChatProcessesUnderApp(shadowPath, syscall.SIGTERM)
+ 		time.Sleep(1 * time.Second)
+-		if hadWeChatRunning && !envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+-			_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++		if hadWeChatRunning {
++			reopenOriginalWeChatAfterPBKDF()
+ 		}
+ 	}
++	fmt.Println("[INFO] Opening wechat-cli WeChat shadow copy...")
++	if _, err := combinedOutputAsInvokingUser("/usr/bin/open", "-n", shadowPath); err != nil {
++		cleanup()
++		return 0, nil, fmt.Errorf("open shadow WeChat: %w", err)
++	}
++	pid, err := waitForWeChatPIDUnderApp(shadowPath, 90*time.Second)
++	if err != nil {
++		cleanup()
++		return 0, nil, err
++	}
+ 	return pid, cleanup, nil
+ }
+ 
+ func prepareShadowWeChatCopy() (string, bool, error) {
++	path, wasRunning, err := prepareShadowWeChatCopyInner()
++	if err != nil && wasRunning {
++		reopenOriginalWeChatAfterPBKDF()
++	}
++	return path, wasRunning, err
++}
++
++func prepareShadowWeChatCopyInner() (string, bool, error) {
+ 	shadowPath, _, _, err := validateShadowWeChatPath(shadowWeChatPath())
+ 	if err != nil {
+ 		return "", false, err
+@@ -1663,7 +1692,8 @@ func stopWeChatForPBKDF(targetAppPath string) bool {
+ 	time.Sleep(2 * time.Second)
+ 	killWeChatProcessesUnderApp(targetAppPath, syscall.SIGKILL)
+ 	for _, pid := range pids {
+-		if pidAlive(pid) {
++		procPath, err := commandPathForPID(pid)
++		if err == nil && (pathInsideApp(procPath, targetAppPath) || pathInsideApp(procPath, wechatAppPath)) {
+ 			_ = syscall.Kill(pid, syscall.SIGKILL)
+ 		}
+ 	}
+@@ -1674,7 +1704,12 @@ func reopenOriginalWeChatAfterPBKDF() {
+ 	if envTrue("WXKEY_NO_REOPEN_ORIGINAL_WECHAT") {
+ 		return
+ 	}
+-	_ = exec.Command("/usr/bin/open", wechatAppPath).Run()
++	if _, err := combinedOutputAsInvokingUser("/usr/bin/open", wechatAppPath); err != nil {
++		fmt.Fprintln(os.Stderr, "[WARN] original_reopen_failed")
++		return
++	}
++	// An accepted open request is not proof of login or database access.
++	fmt.Fprintln(os.Stderr, "[INFO] original_reopen_requested")
+ }
+ 
+ func pbkdfProbeTimeout() time.Duration {
+@@ -1787,6 +1822,7 @@ import hashlib
+ import hmac
+ import json
+ import os
++import pwd
+ import time
+ 
+ import lldb
+@@ -1928,6 +1964,57 @@ def handle_hit(process, frame, salt_to_db, macsalt_to_db, found, seen, counters)
+                 changed = True
+     return changed
+ 
++def owner_launch_info(root):
++    home = os.environ.get("WXKEY_ORIG_HOME") or os.path.expanduser("~")
++    uid = os.stat(home).st_uid
++    if uid == 0 or os.stat(root).st_uid != uid:
++        raise RuntimeError("target_identity_unverified")
++    owner = pwd.getpwuid(uid)
++    info = lldb.SBLaunchInfo([])
++    info.SetUserID(uid)
++    info.SetGroupID(owner.pw_gid)
++    env = dict(os.environ, HOME=home, USER=owner.pw_name, LOGNAME=owner.pw_name)
++    info.SetEnvironmentEntries([key + "=" + value for key, value in env.items()], False)
++    info.SetLaunchFlags(info.GetLaunchFlags() | lldb.eLaunchFlagStopAtEntry)
++    return info, uid, owner.pw_gid
++
++def verify_process_owner(process, uid, gid):
++    info = process.GetProcessInfo()
++    valid = (info.IsValid() and info.UserIDIsValid() and info.EffectiveUserIDIsValid()
++             and info.GroupIDIsValid() and info.EffectiveGroupIDIsValid())
++    if not valid:
++        raise RuntimeError("target_identity_unverified")
++    if (info.GetUserID(), info.GetEffectiveUserID(), info.GetGroupID(), info.GetEffectiveGroupID()) != (uid, uid, gid, gid):
++        raise RuntimeError("target_identity_mismatch")
++
++def wait_for_stop(process, listener, deadline, previous_stop=None):
++    while time.monotonic() < deadline:
++        state = process.GetState()
++        if state == lldb.eStateStopped and process.GetStopID() != previous_stop:
++            return True
++        if state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
++            return False
++        listener.WaitForEvent(1, lldb.SBEvent())
++    return False
++
++def launch_as_owner(target, root, deadline):
++    info, uid, gid = owner_launch_info(root)
++    listener = lldb.SBListener("rion-pbkdf-launch")
++    info.SetListener(listener)
++    error = lldb.SBError()
++    process = target.Launch(info, error)
++    try:
++        if error.Fail() or not process.IsValid():
++            raise RuntimeError("target_launch_failed")
++        if not wait_for_stop(process, listener, deadline):
++            raise RuntimeError("target_entry_timeout")
++        verify_process_owner(process, uid, gid)
++        return process, listener
++    except Exception:
++        if process.IsValid():
++            process.Kill()
++        raise
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--exe", required=True)
+@@ -1938,49 +2025,44 @@ def main():
+     args = ap.parse_args()
+     dbs, salt_to_db, macsalt_to_db = build_db_maps(args.root)
+     debugger = lldb.SBDebugger.Create()
+-    debugger.SetAsync(False)
++    debugger.SetAsync(True)
+     target = debugger.CreateTarget(args.exe)
+     if not target.IsValid():
+         raise RuntimeError("invalid target")
+     bp = target.BreakpointCreateByName("CCKeyDerivationPBKDF")
+     if not bp.IsValid() or bp.GetNumLocations() == 0:
+         raise RuntimeError("CCKeyDerivationPBKDF breakpoint did not resolve")
+-    process = target.Launch(lldb.SBLaunchInfo([]), lldb.SBError())
+-    if not process.IsValid():
+-        raise RuntimeError("launch failed")
++    deadline = time.monotonic() + args.timeout
++    process, listener = launch_as_owner(target, args.root, deadline)
+     found = {}
+     seen = set()
+     counters = {"hits": 0, "kdf_256k_salt_hits": 0, "mac_kdf_salt_hits": 0, "stops": 0, "found": 0, "early_stop": 0}
+-    deadline = time.time() + args.timeout
++    previous_stop = None
+     try:
+-        while time.time() < deadline:
+-            state = process.GetState()
+-            if state == lldb.eStateStopped:
+-                counters["stops"] += 1
+-                changed = False
+-                for i in range(process.GetNumThreads()):
+-                    thread = process.GetThreadAtIndex(i)
+-                    if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+-                        continue
+-                    changed = handle_hit(process, thread.GetFrameAtIndex(0), salt_to_db, macsalt_to_db, found, seen, counters) or changed
+-                if changed:
+-                    write_result(args.out, dbs, salt_to_db, found, seen, counters)
+-                if should_stop_early(found, seen, salt_to_db, args.early_stop):
+-                    counters["early_stop"] = 1
+-                    break
+-            elif state in (lldb.eStateExited, lldb.eStateCrashed, lldb.eStateDetached):
++        while wait_for_stop(process, listener, deadline, previous_stop):
++            previous_stop = process.GetStopID()
++            counters["stops"] += 1
++            changed = False
++            for i in range(process.GetNumThreads()):
++                thread = process.GetThreadAtIndex(i)
++                if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
++                    continue
++                changed = handle_hit(process, thread.GetFrameAtIndex(0), salt_to_db, macsalt_to_db, found, seen, counters) or changed
++            if changed:
++                write_result(args.out, dbs, salt_to_db, found, seen, counters)
++            if should_stop_early(found, seen, salt_to_db, args.early_stop):
++                counters["early_stop"] = 1
+                 break
+-            process.Continue()
++            if process.Continue().Fail():
++                raise RuntimeError("target_continue_failed")
+     finally:
+-        write_result(args.out, dbs, salt_to_db, found, seen, counters)
+-        try:
+-            process.Stop()
+-        except Exception:
+-            pass
+         try:
+-            process.Detach()
+-        except Exception:
+-            pass
++            write_result(args.out, dbs, salt_to_db, found, seen, counters)
++        finally:
++            try:
++                process.Kill()
++            finally:
++                lldb.SBDebugger.Destroy(debugger)
+ 
+ if __name__ == "__main__":
+     main()
+@@ -2230,7 +2312,7 @@ func writeJSON(v any) {
+ 
+ func fail(format string, args ...any) {
+ 	fmt.Fprintf(os.Stderr, "[wxkey] ERROR: "+format+"\n", args...)
+-	os.Exit(1)
++	panic(commandFailure{})
+ }
+ 
+ func dieUsage(format string, args ...any) {
+diff --git a/cmd/wxkey/recovery_candidate_test.go b/cmd/wxkey/recovery_candidate_test.go
+new file mode 100644
+index 0000000..b28e424
+--- /dev/null
++++ b/cmd/wxkey/recovery_candidate_test.go
+@@ -0,0 +1,39 @@
++package main
++
++import (
++	"os/exec"
++	"testing"
++)
++
++func TestFailureUnwindsCleanup(t *testing.T) {
++	cleaned := false
++	code := failureExit(func() {
++		defer func() { cleaned = true }()
++		fail("synthetic failure")
++	})
++	if code != 1 || !cleaned {
++		t.Fatalf("code=%d cleanup=%v", code, cleaned)
++	}
++}
++
++func TestSuccessfulCommandReturnsZero(t *testing.T) {
++	if code := failureExit(func() {}); code != 0 {
++		t.Fatalf("code=%d", code)
++	}
++}
++
++func TestUnexpectedPanicNotHidden(t *testing.T) {
++	defer func() {
++		if recover() != "unexpected" {
++			t.Fatal("unexpected panic was swallowed")
++		}
++	}()
++	failureExit(func() { panic("unexpected") })
++}
++
++func TestLaunchCandidateIsolated(t *testing.T) {
++	out, err := exec.Command("/usr/bin/python3", "../../tests/test_launch_candidate.py", "-v").CombinedOutput()
++	if err != nil {
++		t.Fatalf("isolated launch tests: %v\n%s", err, out)
++	}
++}
+diff --git a/tests/test_launch_candidate.py b/tests/test_launch_candidate.py
+new file mode 100644
+index 0000000..4dae21b
+--- /dev/null
++++ b/tests/test_launch_candidate.py
+@@ -0,0 +1,120 @@
++"""Lifecycle tests using fakes only. No WeChat access or privileged execution."""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace as NS
++import unittest
++from unittest.mock import Mock
++
++SOURCE = Path(__file__).resolve().parents[1] / "cmd/wxkey/main.go"
++PROBE = SOURCE.read_text().split("const pbkdfProbePython = `", 1)[1].split("`", 1)[0]
++NAMES = {"owner_launch_info", "verify_process_owner", "wait_for_stop", "launch_as_owner"}
++FUNCTIONS = ast.Module(body=[node for node in ast.parse(PROBE).body
++                           if isinstance(node, ast.FunctionDef) and node.name in NAMES], type_ignores=[])
++
++
++class LaunchTests(unittest.TestCase):
++    def setUp(self):
++        self.launch = Mock()
++        self.launch.GetLaunchFlags.return_value = 0
++        self.listener = Mock()
++        self.lldb = NS(SBLaunchInfo=lambda _: self.launch, eLaunchFlagStopAtEntry=4,
++                       SBListener=lambda _: self.listener, SBEvent=lambda: object(),
++                       SBError=lambda: NS(Fail=lambda: False), eStateStopped=5,
++                       eStateExited=10, eStateCrashed=8, eStateDetached=9)
++        self.os = NS(environ={"WXKEY_ORIG_HOME": "/home/user", "HOME": "/root"},
++                     path=NS(expanduser=lambda _: "/root"), stat=lambda _: NS(st_uid=501))
++        self.clock = Mock(return_value=0)
++        self.ns = {"lldb": self.lldb, "os": self.os, "time": NS(monotonic=self.clock),
++                   "pwd": NS(getpwuid=lambda _: NS(pw_gid=20, pw_name="user"))}
++        exec(compile(FUNCTIONS, "launch_candidate", "exec"), self.ns)
++        self.info = NS(IsValid=lambda: True, UserIDIsValid=lambda: True,
++                       EffectiveUserIDIsValid=lambda: True, GroupIDIsValid=lambda: True,
++                       EffectiveGroupIDIsValid=lambda: True, GetUserID=lambda: 501,
++                       GetEffectiveUserID=lambda: 501, GetGroupID=lambda: 20,
++                       GetEffectiveGroupID=lambda: 20)
++        self.process = Mock()
++        self.process.IsValid.return_value = True
++        self.process.GetState.return_value = 5
++        self.process.GetStopID.return_value = 1
++        self.process.GetProcessInfo.return_value = self.info
++        self.target = NS(Launch=lambda *_: self.process)
++
++    def test_uid_gid_and_environment_explicit(self):
++        _, uid, gid = self.ns["owner_launch_info"]("/home/user/account")
++        self.assertEqual((uid, gid), (501, 20))
++        self.launch.SetUserID.assert_called_once_with(501)
++        self.launch.SetGroupID.assert_called_once_with(20)
++        entries, append = self.launch.SetEnvironmentEntries.call_args.args
++        self.assertFalse(append)
++        self.assertIn("HOME=/home/user", entries)
++        self.assertIn("LOGNAME=user", entries)
++        self.launch.SetLaunchFlags.assert_called_once_with(4)
++
++    def test_root_owner_rejected(self):
++        self.os.stat = lambda _: NS(st_uid=0)
++        with self.assertRaisesRegex(RuntimeError, "identity_unverified"):
++            self.ns["owner_launch_info"]("/account")
++
++    def test_other_account_owner_rejected(self):
++        self.os.stat = lambda path: NS(st_uid=501 if path == "/home/user" else 502)
++        with self.assertRaisesRegex(RuntimeError, "identity_unverified"):
++            self.ns["owner_launch_info"]("/account")
++
++    def test_actual_root_process_killed_before_return(self):
++        self.info.GetEffectiveUserID = lambda: 0
++        with self.assertRaisesRegex(RuntimeError, "identity_mismatch"):
++            self.ns["launch_as_owner"](self.target, "/account", 10)
++        self.process.Kill.assert_called_once()
++        self.process.Continue.assert_not_called()
++
++    def test_unknown_identity_killed(self):
++        self.info.EffectiveUserIDIsValid = lambda: False
++        with self.assertRaisesRegex(RuntimeError, "identity_unverified"):
++            self.ns["launch_as_owner"](self.target, "/account", 10)
++        self.process.Kill.assert_called_once()
++
++    def test_group_mismatch_rejected(self):
++        self.info.GetEffectiveGroupID = lambda: 0
++        with self.assertRaisesRegex(RuntimeError, "identity_mismatch"):
++            self.ns["verify_process_owner"](self.process, 501, 20)
++
++    def test_valid_launch_does_not_continue_before_caller(self):
++        process, listener = self.ns["launch_as_owner"](self.target, "/account", 10)
++        self.assertIs(process, self.process)
++        self.assertIs(listener, self.listener)
++        self.process.Continue.assert_not_called()
++        self.process.Kill.assert_not_called()
++
++    def test_launch_error_kills_valid_target(self):
++        self.lldb.SBError = lambda: NS(Fail=lambda: True)
++        with self.assertRaisesRegex(RuntimeError, "launch_failed"):
++            self.ns["launch_as_owner"](self.target, "/account", 10)
++        self.process.Kill.assert_called_once()
++
++    def test_running_process_wait_has_deadline(self):
++        self.process.GetState.return_value = 6
++        self.clock.side_effect = [0, 1, 2, 3]
++        self.assertFalse(self.ns["wait_for_stop"](self.process, self.listener, 3))
++        self.assertEqual(self.listener.WaitForEvent.call_count, 3)
++        self.assertTrue(all(call.args[0] == 1 for call in self.listener.WaitForEvent.call_args_list))
++
++    def test_repeated_stop_is_not_handled_twice(self):
++        self.clock.side_effect = [0, 1, 2]
++        self.assertFalse(self.ns["wait_for_stop"](self.process, self.listener, 2, previous_stop=1))
++        self.assertEqual(self.listener.WaitForEvent.call_count, 2)
++
++    def test_exited_process_does_not_spin(self):
++        self.process.GetState.return_value = 10
++        self.assertFalse(self.ns["wait_for_stop"](self.process, self.listener, 10))
++        self.listener.WaitForEvent.assert_not_called()
++
++    def test_entry_timeout_kills_target(self):
++        self.clock.return_value = 11
++        with self.assertRaisesRegex(RuntimeError, "entry_timeout"):
++            self.ns["launch_as_owner"](self.target, "/account", 10)
++        self.process.Kill.assert_called_once()
++
++
++if __name__ == "__main__":
++    unittest.main()

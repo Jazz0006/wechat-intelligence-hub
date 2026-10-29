@@ -1,0 +1,60 @@
+name: 本机接入 / 解密 / 获取 key 失败
+description: 按失败阶段反馈，帮助区分目录、依赖、权限、材料和版本问题
+title: "[接入] 系统版本 / 微信版本 / 失败阶段"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请不要上传key、数据库、原始provider日志、完整配置或聊天截图。
+        请先让Codex运行 `access.sh diagnose --support-summary`，只提交自己检查过的白名单诊断JSON。
+        不要为了反馈反复重启微信，不要关闭SIP。此表单不是再次获取的授权。
+  - type: input
+    id: versions
+    attributes:
+      label: 系统、CPU架构与微信完整版本
+      placeholder: macOS版本 / arm64或x86_64 / 微信版本与build
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: 仓库commit、Reader版本、provider固定版本或未使用
+      description: 不要填写账号、机器名、目录或任何key。
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: 失败在哪一步
+      options:
+        - 安装或运行依赖
+        - 找不到数据库或多个账号
+        - 已有材料无法导入或验证
+        - 文件访问或调试器前置检查
+        - 获取工具准备或启动
+        - 捕获不到key或只有部分覆盖
+        - 查询失败或通知预览模式
+        - 获取后微信没有恢复
+        - 尚无法判断
+    validations:
+      required: true
+  - type: textarea
+    id: safe_status
+    attributes:
+      label: 经本人检查的 diagnose --support-summary 输出
+      description: 原生Windows可让本地Agent用Reader环境的python.exe运行rion_wechat_access.py diagnose --support-summary。没有该命令时填写“不支持”，不要改贴完整配置或原始日志。
+      render: json
+  - type: textarea
+    id: recovery
+    attributes:
+      label: 已尝试的步骤与微信当前状态
+      description: 微信能否正常打开？是否还存在获取进程或副本？不要为填写此项再次获取。
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 隐私检查
+      options:
+        - label: 我已检查以上内容，不包含key、密码、数据库、个人配置、聊天或账号目录。
+          required: true

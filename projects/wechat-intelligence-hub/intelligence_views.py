@@ -6,6 +6,9 @@ import re
 import sqlite3
 from typing import Any, Iterable
 
+from message_time import register_time_sql, timestamp_epoch, validate_window
+from message_identity import conversation_key
+
 
 COMMERCIAL_TERMS = re.compile(
     r"合作|商单|推广|投放|品牌|报价|预算|brief|排期|发布|审核|结算|付款|"
@@ -65,7 +68,85 @@ def normalize_since(value: str | None) -> str:
 
 def is_self_sender(sender: str, self_names: Iterable[str]) -> bool:
     folded = sender.strip().casefold()
-    return any(folded == name.strip().casefold() or folded.startswith(name.strip().casefold()) for name in self_names)
+    return bool(folded) and any(folded == name.strip().casefold() for name in self_names if name.strip())
+
+
+def promise_projects(content: str) -> set[str]:
+    """Only explicit project references; unknown references are not guessed."""
+    refs = set(re.findall(r"([甲乙丙丁戊己庚辛壬癸]|[A-Za-z][A-Za-z0-9_-]*)\s*(?:项目|品牌)", content))
+    refs.update(re.findall(r"(?:项目|品牌)\s*([甲乙丙丁戊己庚辛壬癸]|[A-Za-z][A-Za-z0-9_-]*)", content))
+    for name in re.findall(r"([\u4e00-\u9fff]{1,16})项目", content):
+        name = re.split(r"整理|提交|完成|回传|发送|取消|明天|今天|后天|给|发|做|的", name)[-1]
+        if name and name not in {"这个", "那个", "这次", "上次", "一个", "有个"}:
+            refs.add(name)
+    ignored = {"ai", "brief", "quote", "thread", "kol", "pdf", "ok", "ppt"}
+    refs.update(word for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]*", content) if word.casefold() not in ignored)
+    return {ref.casefold() for ref in refs}
+
+
+def promise_deliverables(content: str) -> set[str]:
+    return {name for name, pattern in (
+        ("draft", r"初稿|二稿|终稿|草稿|旧稿|稿件"),
+        ("data", r"数据|报表"), ("invoice", r"发票|开票"),
+        ("outline", r"大纲|框架|方案"), ("publish", r"发布|上线"),
+    ) if re.search(pattern, content)}
+
+
+def promise_rounds(content: str) -> set[str]:
+    return set(re.findall(r"\d{1,2}月|第[一二三四五六七八九十\d]+轮", content))
+
+
+def open_promise_rows(rows: list[dict[str, Any]], self_names: Iterable[str]) -> list[dict[str, Any]]:
+    """Conservative obligation tracking, isolated by conversation and project.
+
+    A vague acknowledgement cannot settle multiple promises. This is a report
+    inference only; it never mutates the manually maintained opportunity state.
+    """
+    names = tuple(self_names)
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        content = str(row.get("content") or "")
+        own = is_self_sender(str(row.get("sender") or ""), names)
+        is_promise = own and bool(PROMISE_TERMS.search(content))
+        cancelled = bool(re.search(r"取消了|已取消|已经取消|这(?:一)?轮取消|不用(?:再)?(?:交|提交|做|写)|不需要(?:再)?(?:交|提交|做|写)", content))
+        uncertain = bool(re.search(r"如果|假如|要是|是否|会不会|取消[吗么?？]|不取消|未取消|还没|尚未|没有(?:完成|提交|发送|发布|回传)|还未", content))
+        completed = own and bool(PROMISE_COMPLETION_TERMS.search(content))
+        if re.search(r"明天|后天|下周|稍后|之后|等.+再|准备|计划|还要", content):
+            completed = False
+        if is_promise:
+            completed = False
+        if (cancelled or completed) and not uncertain:
+            projects = promise_projects(content)
+            objects = promise_deliverables(content)
+            candidates = []
+            for promise in pending:
+                if conversation_key(str(row.get("chat") or ""), str(row.get("source_file") or "")) != conversation_key(str(promise.get("chat") or ""), str(promise.get("source_file") or "")):
+                    continue
+                old = str(promise["content"])
+                old_projects = promise_projects(old)
+                if projects and (not old_projects or projects != old_projects):
+                    continue
+                if promise_rounds(content) and promise_rounds(old) and promise_rounds(content) != promise_rounds(old):
+                    continue
+                old_objects = promise_deliverables(old)
+                if objects and old_objects and not objects.intersection(old_objects):
+                    continue
+                candidates.append(promise)
+            # An unqualified "done/cancelled" cannot resolve several obligations.
+            if len(candidates) == 1:
+                pending.remove(candidates[0])
+        if is_promise and not cancelled:
+            projects = promise_projects(content)
+            if projects:
+                pending = [old for old in pending if not (
+                    conversation_key(str(row.get("chat") or ""), str(row.get("source_file") or ""))
+                    == conversation_key(str(old.get("chat") or ""), str(old.get("source_file") or ""))
+                    and projects == promise_projects(str(old["content"]))
+                    and promise_deliverables(content) == promise_deliverables(str(old["content"]))
+                    and promise_rounds(content) == promise_rounds(str(old["content"]))
+                )]
+            pending.append(row)
+    return pending
 
 
 def known_group_chats(conn: sqlite3.Connection) -> set[str]:
@@ -121,9 +202,10 @@ def infer_promise_action(content: str) -> str:
 
 
 def resolve_chat_name(conn: sqlite3.Connection, query: str) -> str:
+    register_time_sql(conn)
     rows = conn.execute(
         """
-        select chat, count(*) as message_count, max(time) as last_time
+        select chat, count(*) as message_count, max(message_epoch(time)) as last_time
         from messages
         where lower(chat) like ?
         group by chat
@@ -467,10 +549,7 @@ def reply_report(
     incoming = [row for row in conversation if not is_self_sender(str(row["sender"]), self_names)]
     latest_incoming = incoming[-1] if incoming else None
     latest_overall = conversation[-1] if conversation else None
-    promises = [
-        row for row in messages
-        if is_self_sender(str(row["sender"]), self_names) and PROMISE_TERMS.search(str(row["content"]))
-    ]
+    promises = open_promise_rows(messages, self_names)
     opportunity_row = conn.execute(
         """
         select id, title, stage, status, priority, next_action, next_follow_up
@@ -529,8 +608,9 @@ def reply_report(
     )
     if opportunity:
         lines.append(f"- 商机：#{opportunity['id']}｜{stage}｜{str(opportunity.get('next_action') or '待确认')}")
-    if promises and reply_needed:
-        lines.append(f"- 注意已有承诺：{shorten(promises[-1]['content'], 100)}")
+    if reply_needed:
+        for promise in promises:
+            lines.append(f"- 注意待核实承诺：{shorten(promise['content'], 100)}")
     metadata = {
         "chat": chat,
         "messages": len(messages),
@@ -731,14 +811,16 @@ def topic_report(
 
 
 def _window_messages(conn: sqlite3.Connection, since: str, until: str, limit: int = 12000) -> list[dict[str, Any]]:
+    register_time_sql(conn)
+    validate_window(since, until)
     return [
         dict(row)
         for row in conn.execute(
             """
             select chat, sender, time, content, source_file
             from messages
-            where time >= ? and time < ?
-            order by time asc
+            where message_epoch(time) >= message_epoch(?) and message_epoch(time) < message_epoch(?)
+            order by message_epoch(time) asc, id asc
             limit ?
             """,
             (since, until, limit),
@@ -758,19 +840,20 @@ def brief_report(
     since_dt = current - timedelta(hours=max(1, hours))
     previous_since_dt = since_dt - timedelta(hours=max(1, hours))
     fmt = "%Y-%m-%d %H:%M:%S"
-    current_rows = _window_messages(conn, since_dt.strftime(fmt), current.strftime(fmt))
-    previous_rows = _window_messages(conn, previous_since_dt.strftime(fmt), since_dt.strftime(fmt))
+    current_rows = _window_messages(conn, since_dt.isoformat(), current.isoformat())
+    previous_rows = _window_messages(conn, previous_since_dt.isoformat(), since_dt.isoformat())
     groups = known_group_chats(conn)
 
     def chat_count(rows: list[dict[str, Any]]) -> int:
         return len({str(row["chat"]) for row in rows})
 
-    latest_db_time = str(conn.execute("select max(time) from messages").fetchone()[0] or "")
+    latest_row = conn.execute("select time from messages order by message_epoch(time) desc limit 1").fetchone()
+    latest_db_time = str(latest_row[0] or "") if latest_row else ""
     freshness_hours: float | None = None
     if latest_db_time:
         try:
-            freshness_hours = max(0.0, (current - datetime.fromisoformat(latest_db_time)).total_seconds() / 3600)
-        except ValueError:
+            freshness_hours = max(0.0, (current.timestamp() - timestamp_epoch(latest_db_time)) / 3600)
+        except (ValueError, TypeError):
             pass
 
     by_chat: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -803,31 +886,15 @@ def brief_report(
 
     pending_replies: list[tuple[str, dict[str, Any]]] = []
     for chat, rows in direct_ranked_all:
-        latest = sorted(rows, key=lambda row: str(row["time"]))[-1]
+        latest = sorted(rows, key=lambda row: timestamp_epoch(row["time"]) or 0)[-1]
         if not is_self_sender(str(latest["sender"]), self_names) and REQUEST_TERMS.search(str(latest["content"])):
             pending_replies.append((chat, latest))
 
     open_promises: list[tuple[str, dict[str, Any], str]] = []
     for chat, rows in direct_ranked_all:
-        ordered = sorted(rows, key=lambda row: str(row["time"]))
-        promise_indexes = [
-            index
-            for index, row in enumerate(ordered)
-            if is_self_sender(str(row["sender"]), self_names)
-            and PROMISE_TERMS.search(str(row["content"]))
-        ]
-        if not promise_indexes:
-            continue
-        promise_index = promise_indexes[-1]
-        later_self_messages = [
-            row
-            for row in ordered[promise_index + 1 :]
-            if is_self_sender(str(row["sender"]), self_names)
-        ]
-        if any(PROMISE_COMPLETION_TERMS.search(str(row["content"])) for row in later_self_messages):
-            continue
-        promise = ordered[promise_index]
-        open_promises.append((chat, promise, infer_promise_action(str(promise["content"]))))
+        ordered = sorted(rows, key=lambda row: timestamp_epoch(row["time"]) or 0)
+        for promise in open_promise_rows(ordered, self_names):
+            open_promises.append((chat, promise, infer_promise_action(str(promise["content"]))))
     open_promises.sort(key=lambda item: str(item[1]["time"]), reverse=True)
 
     tracked_opportunities = [

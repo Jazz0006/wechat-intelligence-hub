@@ -14,6 +14,8 @@ import shutil
 import subprocess
 from urllib.parse import unquote, urlsplit
 
+from report_security import protect_document, require_sanitizer, sanitize_fragment
+
 
 GENERATED_NAMES = {"wechat_daily_full.md", "wechat_daily_report.md"}
 MARKDOWN_SITE_DIR = "wechat-report"
@@ -310,13 +312,14 @@ def write_markdown_site(
 
 
 def _pandoc_fragment(source: ReportSource, pandoc: str) -> str:
-    command = [pandoc, "--from=gfm", "--to=html5", f"--id-prefix={source.source_id}-"]
+    command = [pandoc, "--sandbox", "--from=gfm-raw_html", "--to=html5", f"--id-prefix={source.source_id}-"]
     normalized = _normalize_details_markdown(source.path.read_text(encoding="utf-8", errors="replace"))
-    result = subprocess.run(command, input=normalized, text=True, capture_output=True)
+    result = subprocess.run(command, input=normalized, text=True, capture_output=True, timeout=60)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "Pandoc 转换失败").strip()
         raise RuntimeError(f"{source.relative_path}: {detail}")
-    return re.sub(r"(?s)^.*?<h1[^>]*>.*?</h1>", "", result.stdout, count=1).strip()
+    fragment = re.sub(r"(?s)^.*?<h1[^>]*>.*?</h1>", "", result.stdout, count=1).strip()
+    return sanitize_fragment(fragment, id_prefix=f"{source.source_id}-", allow_parent=True)
 
 
 def _rewrite_html_links(fragment: str, *, source: ReportSource, source_pages: dict[Path, ReportPage]) -> str:
@@ -327,7 +330,7 @@ def _rewrite_html_links(fragment: str, *, source: ReportSource, source_pages: di
         except ValueError:
             return match.group(0)
         if parsed.scheme in {"http", "https"}:
-            return f'<a{before}href="{href}"{after} target="_blank" rel="noopener noreferrer" class="original-link">'
+            return f'<a{before}href="{href}"{after} target="_blank" class="original-link">'
         if parsed.scheme:
             return match.group(0)
         if href.startswith("#"):
@@ -340,7 +343,7 @@ def _rewrite_html_links(fragment: str, *, source: ReportSource, source_pages: di
             return f'<a{before}href="#/{target_page.route}/{anchor}"{after} class="internal-link">'
         if candidate.name in GENERATED_NAMES or candidate.name == "wechat_daily_report.html":
             return f'<a{before}href="#/overview"{after} class="internal-link">'
-        return match.group(0)
+        return f'<a{before}{after}>'
 
     return re.sub(r'<a([^>]*?)href="([^"]+)"([^>]*)>', replace, fragment)
 
@@ -362,7 +365,8 @@ def _heading_count(page: ReportPage) -> int:
 
 def _wrap_key_group_sections(fragment: str) -> str:
     """Make each key-group heading an HTML disclosure without touching Markdown."""
-    heading_pattern = re.compile(r'<h2(?:\s+id="([^"]+)")?[^>]*>(.*?)</h2>', re.I | re.S)
+    level = 2 if re.search(r"<h2\b", fragment, re.I) else 3
+    heading_pattern = re.compile(rf'<h{level}(?:\s+id="([^"]+)")?[^>]*>(.*?)</h{level}>', re.I | re.S)
     matches = list(heading_pattern.finditer(fragment))
     if not matches:
         return fragment
@@ -679,6 +683,7 @@ def render_report_bundle(
     markdown_output_path: Path | None = None,
     title: str | None = None,
 ) -> tuple[Path, Path, list[ReportSource]]:
+    require_sanitizer()
     root = report_dir.expanduser().resolve()
     sources = discover_report_sources(root)
     if not sources:
@@ -735,5 +740,5 @@ def render_report_bundle(
     }
     html = _replace_tokens(html, values)
     html_path.parent.mkdir(parents=True, exist_ok=True)
-    html_path.write_text(html, encoding="utf-8")
+    html_path.write_text(protect_document(html), encoding="utf-8")
     return html_path, markdown_path, sources

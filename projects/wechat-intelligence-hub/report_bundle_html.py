@@ -13,6 +13,8 @@ import shutil
 import subprocess
 from urllib.parse import unquote, urlsplit
 
+from report_security import protect_document, require_sanitizer, sanitize_fragment
+
 
 GENERATED_NAMES = {
     "wechat_daily_full.md",
@@ -154,16 +156,17 @@ def _pandoc_fragment(source: ReportSource, pandoc: str) -> str:
     command = [
         pandoc,
         str(source.path),
-        "--from=gfm",
+        "--sandbox",
+        "--from=gfm-raw_html",
         "--to=html5",
         f"--id-prefix={source.source_id}-",
     ]
-    result = subprocess.run(command, text=True, capture_output=True)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=60)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "Pandoc 转换失败").strip()
         raise RuntimeError(f"{source.relative_path}: {detail}")
     fragment = re.sub(r"(?s)^.*?<h1[^>]*>.*?</h1>", "", result.stdout, count=1)
-    return fragment.strip()
+    return sanitize_fragment(fragment.strip(), id_prefix=f"{source.source_id}-", allow_parent=True)
 
 
 def _rewrite_links(
@@ -179,7 +182,7 @@ def _rewrite_links(
         except ValueError:
             return match.group(0)
         if parsed.scheme in {"http", "https"}:
-            return f'<a{before}href="{href}"{after} target="_blank" rel="noopener noreferrer" class="original-link">'
+            return f'<a{before}href="{href}"{after} target="_blank" class="original-link">'
         if parsed.scheme or href.startswith("#"):
             return match.group(0)
         candidate = (source.path.parent / unquote(parsed.path)).resolve()
@@ -187,7 +190,7 @@ def _rewrite_links(
         if target_id:
             target = f"#{target_id}-{parsed.fragment}" if parsed.fragment else f"#source-{target_id}"
             return f'<a{before}href="{target}"{after} class="internal-link">'
-        return match.group(0)
+        return f'<a{before}{after}>'
 
     return re.sub(r'<a([^>]*?)href="([^"]+)"([^>]*)>', replace, fragment)
 
@@ -235,6 +238,7 @@ def render_report_bundle(
     markdown_output_path: Path | None = None,
     title: str | None = None,
 ) -> tuple[Path, Path, list[ReportSource]]:
+    require_sanitizer()
     root = report_dir.expanduser().resolve()
     sources = discover_report_sources(root)
     if not sources:
@@ -528,10 +532,11 @@ def render_report_bundle(
 </body>
 </html>"""
     html_path.parent.mkdir(parents=True, exist_ok=True)
-    html_path.write_text(html, encoding="utf-8")
+    html_path.write_text(protect_document(html), encoding="utf-8")
     return html_path, markdown_path, sources
 
 
 # Keep the established import path while the complete sectioned renderer lives in
 # its own module. Older helpers above remain available to downstream callers.
+_render_legacy_report_bundle = render_report_bundle
 from report_bundle_flagship import render_report_bundle as render_report_bundle

@@ -20,3 +20,9 @@ Do not open a public issue containing chat samples, credentials, database fragme
 ## Operating Boundary
 
 The project is read-only by design. It must not send messages, add contacts, transfer files, make payments, or mutate WeChat data. Third-party local readers can break after a WeChat upgrade; run the compatibility check before relying on a fresh report.
+
+## HTML Reports
+
+Install the pinned sanitizer using `bash scripts/setup_html.sh`; Markdown commands do not need it. The bundle renderers disable raw HTML, apply an nh3 allowlist and add a hash-based CSP. No embedded images or automatic remote fetches are allowed. Only known local report links are routed internally; HTTP(S) sources open on an explicit click. Missing sanitizer or unexpected script structure stops HTML generation.
+
+Existing HTML files are not repaired automatically. Regenerate them using the upgraded engine before opening or sharing. This is not a guarantee about third-party Markdown viewers, browser extensions or the contents of external links.

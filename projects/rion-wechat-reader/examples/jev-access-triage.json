@@ -1,0 +1,26 @@
+{
+  "model": "jev-latest",
+  "state": {
+    "notice": "Entirely synthetic fixtures; no chat, credentials or user paths.",
+    "case_a": {"access_state": "dependency_required", "sqlcipher_driver_ready": false},
+    "case_b": {"access_state": "access_material_requires_review", "material_error": "key_salt_mismatch"},
+    "case_c": {"access_state": "ready", "historical_signals": ["no_derivation_observed"], "recovery_review_required": true}
+  },
+  "questions": {
+    "case_a": {
+      "type": "choice",
+      "instructions": "Which next action fits case_a? Treat this as diagnostic advice, not execution permission.",
+      "criteria": {"fix_runtime": "Repair the SQLCipher dependency in the actual interpreter", "get_new_key": "Acquire key again", "ready": "Use verified data"}
+    },
+    "case_b": {
+      "type": "choice",
+      "instructions": "Which next action fits case_b? A salt mismatch is not proof the current WeChat version is unsupported.",
+      "criteria": {"check_material": "Check source account, database and material salt", "downgrade_wechat": "Downgrade WeChat immediately", "ready": "Use verified data"}
+    },
+    "case_c": {
+      "type": "choice",
+      "instructions": "Which next action fits case_c? Current verified readiness outranks historical signals; recovery review is separate from data reads.",
+      "criteria": {"reuse_and_review": "Reuse readable configuration and separately review recovery", "get_new_key": "Acquire again because of old signal", "clear_lock": "Automatically delete recovery lock"}
+    }
+  }
+}

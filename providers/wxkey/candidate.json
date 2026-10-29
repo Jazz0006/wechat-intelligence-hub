@@ -1,0 +1,10 @@
+{
+  "upstream": "https://github.com/r266-tech/wxkey",
+  "base_commit": "01e96fa58ce3ff061dce83e4c36f62104ebc6b16",
+  "patch": "lifecycle.patch",
+  "patch_sha256": "b7052b04c0703a80099ec0ce77f9f042fbf1bcf04f779c07dde147a888387eb3",
+  "go_version": "1.26.5",
+  "status": "candidate_not_default",
+  "fresh_wechat_acquisition_verified": false,
+  "privileged_launch_verified": false
+}

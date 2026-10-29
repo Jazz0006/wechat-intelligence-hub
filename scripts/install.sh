@@ -9,6 +9,7 @@ wechat_hub_target="$codex_root/share/wechat-intelligence-hub/projects/wechat-int
 wechat_reader_source="$repo_root/projects/rion-wechat-reader"
 wechat_reader_target="$codex_root/share/wechat-intelligence-hub/projects/rion-wechat-reader"
 with_sqlcipher=0
+with_html=0
 skill_names=()
 
 for argument in "$@"; do
@@ -16,8 +17,11 @@ for argument in "$@"; do
     --with-sqlcipher)
       with_sqlcipher=1
       ;;
+    --with-html)
+      with_html=1
+      ;;
     -h|--help)
-      echo "Usage: ./scripts/install.sh [--with-sqlcipher] [wechat-cli] [wechat-intelligence-hub]"
+      echo "Usage: ./scripts/install.sh [--with-sqlcipher] [--with-html] [wechat-cli] [wechat-intelligence-hub]"
       echo "With no skill names, the complete WeChat Intelligence Hub is installed."
       exit 0
       ;;
@@ -150,6 +154,12 @@ if [ "$installed_wechat_hub" -eq 1 ]; then
     --root "$wechat_hub_source" \
     --out "$wechat_hub_target"
   echo "Installed engine -> $wechat_hub_target"
+  if [ "$with_html" -eq 1 ]; then
+    bash "$wechat_hub_target/scripts/setup_html.sh"
+  else
+    echo "For HTML reports, run: bash \"$wechat_hub_target/scripts/setup_html.sh\""
+    echo "Pandoc is also required. Markdown commands do not require nh3."
+  fi
 
   cat <<'EOF'
 

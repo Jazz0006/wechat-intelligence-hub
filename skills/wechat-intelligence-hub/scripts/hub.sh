@@ -4,7 +4,7 @@ umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${WECHAT_HUB_HOME:-}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 
 if [ -z "$PROJECT_DIR" ]; then
   for candidate in \
@@ -34,4 +34,10 @@ if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/wechat_intelligence_hub.py" ]; 
 fi
 
 cd "$PROJECT_DIR"
+if [ -z "$PYTHON_BIN" ]; then
+  PYTHON_BIN="python3"
+  if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+  fi
+fi
 exec "$PYTHON_BIN" wechat_intelligence_hub.py "$@"

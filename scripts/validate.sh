@@ -21,9 +21,14 @@ fi
 
 hub_release_test="$(mktemp -d)"
 trap 'rm -rf -- "$hub_release_test"' EXIT
+python3 -m unittest discover -s "$repo_root/providers/wxkey/tests" -v
 python3 "$repo_root/projects/wechat-intelligence-hub/scripts/build_release.py" \
   --out "$hub_release_test/wechat-intelligence-hub"
 test -f "$hub_release_test/wechat-intelligence-hub/release-manifest.json"
+# The encrypted integration fixture expects the separately shipped Reader sibling.
+mkdir -p "$hub_release_test/rion-wechat-reader"
+install -m 0755 "$repo_root/projects/rion-wechat-reader/rion_wechat_reader.py" \
+  "$hub_release_test/rion-wechat-reader/rion_wechat_reader.py"
 (
   cd "$hub_release_test/wechat-intelligence-hub"
   python3 -m unittest discover -s tests -v
@@ -38,6 +43,7 @@ trap - EXIT
 )
 
 reader_install_test="$(mktemp -d)"
+reader_install_test="$(cd "$reader_install_test" && pwd -P)"
 trap 'rm -rf "$reader_install_test"' EXIT
 "$repo_root/projects/rion-wechat-reader/install.sh" --prefix "$reader_install_test"
 "$reader_install_test/bin/rion-wechat-cli" version >/dev/null
@@ -46,6 +52,8 @@ HOME="$reader_install_test/home" "$reader_install_test/bin/rion-wechat-cli" doct
 "$reader_install_test/bin/rion-wechat-reader" version >/dev/null
 "$reader_install_test/bin/rion-wechat-access" --help >/dev/null
 "$reader_install_test/bin/rion-wechat-access" onboard --help >/dev/null
+"$reader_install_test/bin/rion-wechat-access" finish-recovery --help >/dev/null
+HOME="$reader_install_test/home" "$reader_install_test/bin/rion-wechat-access" status >/dev/null
 test -f "$reader_install_test/share/rion-wechat-cli/rion_wechat_reader.py"
 rm -rf "$reader_install_test"
 trap - EXIT
@@ -89,6 +97,7 @@ CODEX_HOME="$codex_skill_install_test" \
   "$repo_root/scripts/install.sh"
 test -f "$codex_skill_install_test/skills/wechat-cli/SKILL.md"
 test -f "$codex_skill_install_test/skills/wechat-cli/references/experimental-access.md"
+test -f "$codex_skill_install_test/skills/wechat-cli/references/access-troubleshooting.md"
 test -f "$codex_skill_install_test/skills/wechat-intelligence-hub/SKILL.md"
 test -f "$codex_skill_install_test/share/wechat-intelligence-hub/projects/rion-wechat-reader/rion_wechat_reader.py"
 test -f "$codex_skill_install_test/share/wechat-intelligence-hub/projects/wechat-intelligence-hub/wechat_intelligence_hub.py"
